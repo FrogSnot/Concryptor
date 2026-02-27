@@ -1,5 +1,6 @@
+use std::alloc;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
@@ -11,7 +12,10 @@ use rayon::prelude::*;
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 
 use crate::crypto::{derive_key, derive_nonce, zeroize_key};
-use crate::header::{CipherType, Header, HEADER_SIZE, NONCE_LEN, SALT_LEN, TAG_SIZE};
+use crate::header::{
+    aligned_chunk_disk_size, CipherType, Header, ALIGNED_HEADER_SIZE, HEADER_SIZE, NONCE_LEN,
+    SALT_LEN, SECTOR_SIZE, TAG_SIZE,
+};
 
 pub const DEFAULT_CHUNK_SIZE: u32 = 4 * 1024 * 1024; // 4 MiB
 
@@ -127,16 +131,84 @@ fn drain_slot(
     Ok(())
 }
 
+/// 4096-byte aligned buffer for O_DIRECT I/O.
+/// Allocated via `std::alloc` with `Layout::from_size_align(len, SECTOR_SIZE)`.
+struct AlignedBuf {
+    ptr: *mut u8,
+    len: usize,
+    layout: alloc::Layout,
+}
+
+impl AlignedBuf {
+    fn new(len: usize) -> Self {
+        assert!(len > 0 && len % SECTOR_SIZE == 0);
+        let layout = alloc::Layout::from_size_align(len, SECTOR_SIZE).unwrap();
+        let ptr = unsafe { alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            alloc::handle_alloc_error(layout);
+        }
+        Self { ptr, len, layout }
+    }
+
+    fn as_mut_ptr(&self) -> *mut u8 { self.ptr }
+    fn as_ptr(&self) -> *const u8 { self.ptr }
+}
+
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        unsafe { alloc::dealloc(self.ptr, self.layout); }
+    }
+}
+
+impl std::ops::Deref for AlignedBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl std::ops::DerefMut for AlignedBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+// SAFETY: raw memory with no interior references; access synchronized via io_uring CQE drain.
+unsafe impl Send for AlignedBuf {}
+unsafe impl Sync for AlignedBuf {}
+
+fn pwrite_aligned(fd: i32, buf: &[u8], offset: i64) -> Result<()> {
+    let n = unsafe { libc::pwrite(fd, buf.as_ptr().cast(), buf.len(), offset) };
+    if n < 0 {
+        bail!("pwrite: {}", std::io::Error::last_os_error());
+    }
+    if n as usize != buf.len() {
+        bail!("short pwrite: {} of {} bytes", n, buf.len());
+    }
+    Ok(())
+}
+
+fn pread_aligned(fd: i32, buf: &mut [u8], offset: i64) -> Result<()> {
+    let n = unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), buf.len(), offset) };
+    if n < 0 {
+        bail!("pread: {}", std::io::Error::last_os_error());
+    }
+    if n as usize != buf.len() {
+        bail!("short pread: {} of {} bytes", n, buf.len());
+    }
+    Ok(())
+}
+
 /// Pre-allocated reusable buffer pool for one pipeline slot.
 /// Each slot holds `batch_cap` chunk buffers of `buf_size` bytes each.
 struct SlotPool {
-    bufs: Vec<Vec<u8>>,
+    bufs: Vec<AlignedBuf>,
     count: usize,
 }
 
 impl SlotPool {
     fn new(count: usize, buf_size: usize) -> Self {
-        let bufs = (0..count).map(|_| vec![0u8; buf_size]).collect();
+        let bufs = (0..count).map(|_| AlignedBuf::new(buf_size)).collect();
         Self { bufs, count }
     }
 
@@ -213,23 +285,28 @@ pub fn encrypt_with_cipher(
     let num_chunks = Header::num_chunks(input_len, chunk_size) as usize;
     let output_size = Header::output_size(input_len, chunk_size);
     let last_chunk_idx = (num_chunks - 1) as u64;
-    let chunk_enc_size = cs + TAG_SIZE as u64;
+    let disk_chunk = aligned_chunk_disk_size(chunk_size);
 
     let header = Header::new(cipher_type, chunk_size, input_len, salt, base_nonce);
     let mut header_bytes = [0u8; HEADER_SIZE];
     header.serialize(&mut header_bytes);
 
-    let mut output_file = OpenOptions::new()
+    let output_file = OpenOptions::new()
         .read(true).write(true).create(true).truncate(true)
+        .custom_flags(libc::O_DIRECT)
+        .mode(0o600)
         .open(output_path)
         .with_context(|| format!("cannot create output: {}", output_path.display()))?;
     output_file.set_len(output_size)?;
-    output_file.write_all(&header_bytes)?;
+    // Write the 4 KiB aligned header (52 bytes data + zero padding).
+    let mut aligned_hdr = AlignedBuf::new(ALIGNED_HEADER_SIZE);
+    aligned_hdr[..HEADER_SIZE].copy_from_slice(&header_bytes);
+    pwrite_aligned(output_file.as_raw_fd(), &aligned_hdr, 0)?;
 
     let input_fd = types::Fd(input_file.as_raw_fd());
     let output_fd = types::Fd(output_file.as_raw_fd());
-    let batch_cap = compute_batch_cap(num_chunks, cs);
-    let buf_size = cs as usize + TAG_SIZE;
+    let batch_cap = compute_batch_cap(num_chunks, disk_chunk);
+    let buf_size = disk_chunk as usize;
 
     // Pre-allocate buffer pools BEFORE the ring so they outlive it (no UAF).
     let mut slots: Vec<SlotPool> = (0..PIPELINE_DEPTH)
@@ -308,6 +385,8 @@ pub fn encrypt_with_cipher(
                     let aad = build_aad(&header_bytes, i, is_final);
                     let tag = cipher.encrypt_chunk(&nonce, &aad, &mut buf[..pt_len])?;
                     buf[pt_len..pt_len + TAG_SIZE].copy_from_slice(&tag);
+                    // Zero padding for O_DIRECT sector alignment.
+                    buf[pt_len + TAG_SIZE..].fill(0);
                     Ok(())
                 })?;
 
@@ -315,12 +394,11 @@ pub fn encrypt_with_cipher(
             {
                 let mut sq = ring.submission();
                 for (j, i) in (cs_start..cs_end).enumerate() {
-                    let write_len = (chunk_pt_len(i as u64, cs, input_len) + TAG_SIZE) as u32;
-                    let out_off = HEADER_SIZE as u64 + i as u64 * chunk_enc_size;
+                    let out_off = ALIGNED_HEADER_SIZE as u64 + i as u64 * disk_chunk;
                     let sqe = opcode::Write::new(
                         output_fd,
                         slots[crypto_slot].bufs[j].as_ptr(),
-                        write_len,
+                        disk_chunk as u32,
                     )
                     .offset(out_off)
                     .build()
@@ -344,16 +422,21 @@ pub fn decrypt(
     output_path: &Path,
     password: &[u8],
 ) -> Result<()> {
-    let mut input_file = File::open(input_path)
+    let input_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(input_path)
         .with_context(|| format!("cannot open input: {}", input_path.display()))?;
     let input_len = input_file.metadata()?.len();
 
-    if input_len < HEADER_SIZE as u64 {
+    if input_len < ALIGNED_HEADER_SIZE as u64 {
         bail!("file too small to be a valid Concryptor file");
     }
 
+    let mut aligned_hdr = AlignedBuf::new(ALIGNED_HEADER_SIZE);
+    pread_aligned(input_file.as_raw_fd(), &mut aligned_hdr, 0)?;
     let mut header_bytes = [0u8; HEADER_SIZE];
-    input_file.read_exact(&mut header_bytes)?;
+    header_bytes.copy_from_slice(&aligned_hdr[..HEADER_SIZE]);
     let header = Header::deserialize(&header_bytes)?;
 
     let expected = Header::output_size(header.original_size, header.chunk_size);
@@ -371,7 +454,11 @@ pub fn decrypt(
 
     let num_chunks = Header::num_chunks(header.original_size, header.chunk_size);
 
-    decrypt_with_cipher(input_path, output_path, &cipher)?;
+    let result = decrypt_with_cipher(input_path, output_path, &cipher);
+    if result.is_err() {
+        let _ = std::fs::remove_file(output_path);
+    }
+    result?;
 
     eprintln!(
         "Decrypted {} → {} ({} chunks, {})",
@@ -391,16 +478,21 @@ pub fn decrypt_with_cipher(
     output_path: &Path,
     cipher: &Cipher,
 ) -> Result<()> {
-    let mut input_file = File::open(input_path)
+    let input_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(input_path)
         .with_context(|| format!("cannot open input: {}", input_path.display()))?;
     let input_len = input_file.metadata()?.len();
 
-    if input_len < HEADER_SIZE as u64 {
+    if input_len < ALIGNED_HEADER_SIZE as u64 {
         bail!("file too small to be a valid Concryptor file");
     }
 
+    let mut aligned_hdr = AlignedBuf::new(ALIGNED_HEADER_SIZE);
+    pread_aligned(input_file.as_raw_fd(), &mut aligned_hdr, 0)?;
     let mut header_bytes = [0u8; HEADER_SIZE];
-    input_file.read_exact(&mut header_bytes)?;
+    header_bytes.copy_from_slice(&aligned_hdr[..HEADER_SIZE]);
     let header = Header::deserialize(&header_bytes)?;
 
     let expected = Header::output_size(header.original_size, header.chunk_size);
@@ -414,18 +506,43 @@ pub fn decrypt_with_cipher(
     let cs = header.chunk_size as u64;
     let num_chunks = Header::num_chunks(header.original_size, header.chunk_size) as usize;
     let last_chunk_idx = (num_chunks - 1) as u64;
-    let chunk_enc_size = cs + TAG_SIZE as u64;
+    let disk_chunk = aligned_chunk_disk_size(header.chunk_size);
 
     let output_file = OpenOptions::new()
         .read(true).write(true).create(true).truncate(true)
+        .mode(0o600)
         .open(output_path)
         .with_context(|| format!("cannot create output: {}", output_path.display()))?;
     output_file.set_len(header.original_size)?;
 
+    let result = decrypt_pipeline(
+        &input_file, &output_file, cipher, &header_bytes, &header, num_chunks,
+        last_chunk_idx, cs, disk_chunk,
+    );
+
+    if result.is_err() {
+        drop(output_file);
+        let _ = std::fs::remove_file(output_path);
+    }
+    result
+}
+
+/// Inner pipeline for decryption, factored out so the caller can clean up on error.
+fn decrypt_pipeline(
+    input_file: &File,
+    output_file: &File,
+    cipher: &Cipher,
+    header_bytes: &[u8; HEADER_SIZE],
+    header: &Header,
+    num_chunks: usize,
+    last_chunk_idx: u64,
+    cs: u64,
+    disk_chunk: u64,
+) -> Result<()> {
     let input_fd = types::Fd(input_file.as_raw_fd());
     let output_fd = types::Fd(output_file.as_raw_fd());
-    let batch_cap = compute_batch_cap(num_chunks, cs);
-    let buf_size = cs as usize + TAG_SIZE;
+    let batch_cap = compute_batch_cap(num_chunks, disk_chunk);
+    let buf_size = disk_chunk as usize;
 
     let mut slots: Vec<SlotPool> = (0..PIPELINE_DEPTH)
         .map(|_| SlotPool::new(batch_cap, buf_size))
@@ -463,12 +580,11 @@ pub fn decrypt_with_cipher(
             {
                 let mut sq = ring.submission();
                 for (j, i) in (rs..re).enumerate() {
-                    let enc_len = (chunk_pt_len(i as u64, cs, header.original_size) + TAG_SIZE) as u32;
-                    let in_off = HEADER_SIZE as u64 + i as u64 * chunk_enc_size;
+                    let in_off = ALIGNED_HEADER_SIZE as u64 + i as u64 * disk_chunk;
                     let sqe = opcode::Read::new(
                         input_fd,
                         slots[read_slot].bufs[j].as_mut_ptr(),
-                        enc_len,
+                        disk_chunk as u32,
                     )
                     .offset(in_off)
                     .build()
@@ -496,8 +612,13 @@ pub fn decrypt_with_cipher(
                     let pt_len = chunk_pt_len(i, cs, header.original_size);
                     let nonce = derive_nonce(&header.base_nonce, i);
                     let is_final = i == last_chunk_idx;
-                    let aad = build_aad(&header_bytes, i, is_final);
-                    cipher.decrypt_chunk(&nonce, &aad, &mut buf[..pt_len + TAG_SIZE])
+                    let aad = build_aad(header_bytes, i, is_final);
+                    cipher.decrypt_chunk(&nonce, &aad, &mut buf[..pt_len + TAG_SIZE])?;
+                    // Verify sector-alignment padding is untampered.
+                    if buf[pt_len + TAG_SIZE..].iter().any(|&b| b != 0) {
+                        bail!("tampered padding in chunk {i}");
+                    }
+                    Ok(())
                 })?;
 
             // Submit writes for plaintext.

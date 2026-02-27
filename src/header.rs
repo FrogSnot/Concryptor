@@ -1,11 +1,20 @@
 use anyhow::{bail, Context, Result};
 
 pub const MAGIC: &[u8; 10] = b"CONCRYPTOR";
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 pub const TAG_SIZE: usize = 16; // AES-GCM and ChaCha20Poly1305 both use 16-byte tags
 pub const SALT_LEN: usize = 16;
 pub const NONCE_LEN: usize = 12;
 pub const HEADER_SIZE: usize = MAGIC.len() + 1 + 1 + 4 + 8 + SALT_LEN + NONCE_LEN; // 52 bytes
+pub const SECTOR_SIZE: usize = 4096;
+pub const ALIGNED_HEADER_SIZE: usize = SECTOR_SIZE;
+
+/// Disk size of each encrypted chunk slot, padded to the next SECTOR_SIZE boundary.
+/// Every chunk occupies the same slot size for uniform offset arithmetic and O_DIRECT alignment.
+pub fn aligned_chunk_disk_size(chunk_size: u32) -> u64 {
+    let enc_size = chunk_size as u64 + TAG_SIZE as u64;
+    enc_size.div_ceil(SECTOR_SIZE as u64) * SECTOR_SIZE as u64
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -112,9 +121,8 @@ impl Header {
 
     /// Total output file size for encryption.
     pub fn output_size(input_size: u64, chunk_size: u32) -> u64 {
-        let cs = chunk_size as u64;
-        let num_chunks = input_size.div_ceil(cs).max(1);
-        HEADER_SIZE as u64 + input_size + num_chunks * TAG_SIZE as u64
+        let num_chunks = Self::num_chunks(input_size, chunk_size);
+        ALIGNED_HEADER_SIZE as u64 + num_chunks * aligned_chunk_disk_size(chunk_size)
     }
 
     /// Number of chunks for a given input size and chunk size.

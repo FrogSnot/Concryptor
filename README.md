@@ -14,7 +14,8 @@ A multi-threaded AEAD encryption engine built in Rust. Encrypts and decrypts fil
 - **Fresh randomness per file**: Cryptographically random 16-byte salt and 12-byte base nonce are generated for every encryption, stored in the header
 - **In-place encryption**: `seal_in_place_separate_tag` / `open_in_place` via `ring` minimizes allocation in the hot loop
 - **Password zeroization**: Keys and passwords are securely wiped from memory after use
-- **Self-describing file format (v2)**: Header stores cipher, chunk size, original file size, salt, and base nonce
+- **O_DIRECT + sector-aligned format (v3)**: 4 KiB-aligned header and chunk slots enable `O_DIRECT` I/O, bypassing the kernel page cache for DMA-speed reads/writes on NVMe. Buffer pools use `std::alloc` with 4096-byte alignment
+- **Self-describing file format (v3)**: Header stores cipher, chunk size, original file size, salt, and base nonce
 
 ## Performance
 
@@ -25,7 +26,7 @@ Benchmarked with `cargo bench` (Criterion, 10 samples per measurement). Key deri
 - RAM: 2x 8 GiB DDR4-2666 (dual channel, 16 GiB total)
 - OS: Linux
 
-**Note on I/O:** Criterion writes temporary files to `/tmp`, which on this system is `tmpfs` (RAM-backed). Benchmark files never touch a physical disk, so results reflect cipher throughput + `io_uring` submission/completion overhead, not storage bandwidth. DDR4-2666 dual-channel theoretical peak is ~40 GB/s, so memory bandwidth is not the bottleneck.
+**Note on I/O:** Criterion writes temporary files to `/tmp`, which on this system is `tmpfs` (RAM-backed). With `O_DIRECT`, the kernel cannot use real asynchronous DMA on tmpfs, so these numbers reflect cipher throughput + io_uring overhead **without the DMA bypass benefit**. On a real Gen4 NVMe drive, `O_DIRECT` eliminates page-cache double-buffering and enables DMA straight into the aligned buffer pools, which should yield significantly higher throughput.
 
 | File Size | AES-256-GCM Encrypt | ChaCha20 Encrypt | AES-256-GCM Decrypt | ChaCha20 Decrypt |
 |-----------|--------------------:|------------------:|--------------------:|-----------------:|
@@ -64,7 +65,7 @@ Modern AES-NI can push 2-4 GiB/s *per core*. With 12 threads, raw cipher through
 3. **Cache hierarchy effects**: The 5600X has 512 KiB L2 per core and 32 MiB shared L3. The default 4 MiB chunk exceeds L2, and a batch of ~21 chunks (84 MiB active working set) far exceeds L3. Smaller chunk sizes (64-256 KiB) show better throughput in the chunk sweep because more of the working set stays in cache.
 
 **Buffer lifecycle and safety:**
-Buffer pools are allocated once before the io_uring ring is created and are reused across all pipeline iterations without reallocation or zeroing (since io_uring reads overwrite the buffers). The ring is explicitly dropped before the buffer pools, ensuring the kernel never references freed memory (no UAF).
+Buffer pools are allocated once via `std::alloc::alloc_zeroed` with `Layout::from_size_align(size, 4096)` before the io_uring ring is created, and are reused across all pipeline iterations without reallocation. Each encrypted chunk is zero-padded to sector alignment before the O_DIRECT write. The ring is explicitly dropped before the buffer pools, ensuring the kernel never references freed memory (no UAF).
 
 ## Installation
 
@@ -109,24 +110,27 @@ concryptor encrypt --help
 concryptor decrypt --help
 ```
 
-## File Format
+## File Format (v3: Aligned)
 
-All values are little-endian. Total header: 52 bytes.
+All values are little-endian. The header occupies a full 4 KiB sector; each encrypted chunk slot is padded to the next 4 KiB boundary. This ensures every offset and I/O size is sector-aligned for `O_DIRECT`.
 
 ```
 Offset  Size   Field
 ------  -----  ---------------------
 0       10     Magic bytes "CONCRYPTOR"
-10       1     Format version (2)
+10       1     Format version (3)
 11       1     Cipher type (0 = AES-256-GCM, 1 = ChaCha20-Poly1305)
 12       4     Chunk size (bytes, LE)
 16       8     Original file size (bytes, LE)
 24      16     Argon2 salt (cryptographically random, unique per file)
 40      12     Base nonce (cryptographically random, unique per file)
-52      ...    [Chunk 0 ciphertext + 16-byte MAC tag]
-               [Chunk 1 ciphertext + 16-byte MAC tag]
+52    4044     Reserved (zero-padded to 4096 bytes)
+4096    ...    [Chunk 0: ciphertext + 16-byte tag + zero padding to sector boundary]
+               [Chunk 1: ciphertext + 16-byte tag + zero padding to sector boundary]
                ...
 ```
+
+For 4 MiB chunks: each disk slot is `ceil((4194304 + 16) / 4096) * 4096 = 4198400` bytes (4080 bytes of padding per chunk). The 4044 reserved bytes in the header are available for future features (asymmetric key slots, metadata, etc.).
 
 The salt and base nonce are generated fresh from `rand::thread_rng()` (backed by the OS CSPRNG) on every encryption. Reusing a password across files is safe because different salts produce different Argon2id keys, and different base nonces produce different per-chunk nonces.
 
@@ -175,6 +179,7 @@ The test suite covers:
 |-------|---------|
 | `ring` | Assembly-optimized AES-256-GCM and ChaCha20-Poly1305 AEAD |
 | `io-uring` | Linux io_uring interface for async read/write I/O |
+| `libc` | O_DIRECT flag and aligned pread/pwrite for header I/O |
 | `argon2` | Argon2id key derivation |
 | `rayon` | Data-parallel chunk processing |
 | `clap` | CLI argument parsing |

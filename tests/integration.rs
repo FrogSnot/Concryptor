@@ -3,7 +3,10 @@ use std::path::Path;
 
 use concryptor::crypto::{derive_key, derive_nonce};
 use concryptor::engine;
-use concryptor::header::{CipherType, Header, HEADER_SIZE, NONCE_LEN, SALT_LEN, TAG_SIZE};
+use concryptor::header::{
+    aligned_chunk_disk_size, CipherType, Header, ALIGNED_HEADER_SIZE, HEADER_SIZE, NONCE_LEN,
+    SALT_LEN,
+};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -90,7 +93,8 @@ fn header_deserialize_rejects_short_buffer() {
 fn header_output_size_calculation() {
     // 10 MB file, 4 MB chunks -> 3 chunks (4+4+2)
     let size = Header::output_size(10 * 1024 * 1024, 4 * 1024 * 1024);
-    let expected = HEADER_SIZE as u64 + 10 * 1024 * 1024 + 3 * TAG_SIZE as u64;
+    let dcs = aligned_chunk_disk_size(4 * 1024 * 1024);
+    let expected = ALIGNED_HEADER_SIZE as u64 + 3 * dcs;
     assert_eq!(size, expected);
 }
 
@@ -98,7 +102,8 @@ fn header_output_size_calculation() {
 fn header_output_size_empty_file() {
     let size = Header::output_size(0, 4 * 1024 * 1024);
     // Empty file still has 1 chunk (the empty chunk)
-    let expected = HEADER_SIZE as u64 + 0 + 1 * TAG_SIZE as u64;
+    let dcs = aligned_chunk_disk_size(4 * 1024 * 1024);
+    let expected = ALIGNED_HEADER_SIZE as u64 + dcs;
     assert_eq!(size, expected);
 }
 
@@ -325,9 +330,9 @@ fn tampered_ciphertext_detected() {
     engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
         .expect("encrypt failed");
 
-    // Flip a byte in the middle of the ciphertext body
+    // Flip a byte in the middle of the ciphertext body (inside chunk 0)
     let mut data = fs::read(&enc).unwrap();
-    let mid = HEADER_SIZE + data.len() / 2;
+    let mid = ALIGNED_HEADER_SIZE + CHUNK_1MB as usize / 2;
     data[mid] ^= 0xFF;
     fs::write(&enc, &data).unwrap();
 
@@ -346,10 +351,10 @@ fn tampered_tag_detected() {
     engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
         .expect("encrypt failed");
 
-    // Corrupt the last byte (inside the tag of the only chunk)
+    // Corrupt a byte inside the tag of the only chunk
     let mut data = fs::read(&enc).unwrap();
-    let last = data.len() - 1;
-    data[last] ^= 0x01;
+    let tag_start = ALIGNED_HEADER_SIZE + CHUNK_1MB as usize;
+    data[tag_start] ^= 0x01;
     fs::write(&enc, &data).unwrap();
 
     let result = engine::decrypt(&enc, &dec, PASSWORD);
@@ -413,14 +418,14 @@ fn chunk_swap_attack_detected() {
         .expect("encrypt failed");
 
     let mut data = fs::read(&enc).unwrap();
-    let chunk_enc_size = CHUNK_1MB as usize + TAG_SIZE;
+    let dcs = aligned_chunk_disk_size(CHUNK_1MB) as usize;
 
     // Swap chunk 0 and chunk 1 in the body
-    let body_start = HEADER_SIZE;
-    let chunk0 = data[body_start..body_start + chunk_enc_size].to_vec();
-    let chunk1 = data[body_start + chunk_enc_size..body_start + 2 * chunk_enc_size].to_vec();
-    data[body_start..body_start + chunk_enc_size].copy_from_slice(&chunk1);
-    data[body_start + chunk_enc_size..body_start + 2 * chunk_enc_size].copy_from_slice(&chunk0);
+    let body_start = ALIGNED_HEADER_SIZE;
+    let chunk0 = data[body_start..body_start + dcs].to_vec();
+    let chunk1 = data[body_start + dcs..body_start + 2 * dcs].to_vec();
+    data[body_start..body_start + dcs].copy_from_slice(&chunk1);
+    data[body_start + dcs..body_start + 2 * dcs].copy_from_slice(&chunk0);
     fs::write(&enc, &data).unwrap();
 
     let result = engine::decrypt(&enc, &dec, PASSWORD);
@@ -543,7 +548,8 @@ fn truncation_attack_modify_original_size_detected() {
     // then truncates the file to match the new claimed size.
     let data = fs::read(&enc).unwrap();
     let fake_size: u64 = 2 * CHUNK_1MB as u64;
-    let fake_file_size = HEADER_SIZE + (2 * (CHUNK_1MB as usize + TAG_SIZE));
+    let dcs = aligned_chunk_disk_size(CHUNK_1MB) as usize;
+    let fake_file_size = ALIGNED_HEADER_SIZE + 2 * dcs;
     let mut tampered = data[..fake_file_size].to_vec();
     tampered[16..24].copy_from_slice(&fake_size.to_le_bytes());
     fs::write(&enc, &tampered).unwrap();
@@ -570,7 +576,8 @@ fn truncation_attack_remove_last_chunk_detected() {
     // Attacker removes the last chunk and adjusts header to 1 chunk.
     let data = fs::read(&enc).unwrap();
     let fake_size: u64 = CHUNK_1MB as u64;
-    let fake_file_size = HEADER_SIZE + (CHUNK_1MB as usize + TAG_SIZE);
+    let dcs = aligned_chunk_disk_size(CHUNK_1MB) as usize;
+    let fake_file_size = ALIGNED_HEADER_SIZE + dcs;
     let mut tampered = data[..fake_file_size].to_vec();
     tampered[16..24].copy_from_slice(&fake_size.to_le_bytes());
     fs::write(&enc, &tampered).unwrap();
@@ -606,4 +613,52 @@ fn modified_chunk_size_in_header_detected() {
     // File size won't match the new header's expectation, OR AAD mismatch will catch it
     let result = engine::decrypt(&enc, &dec, PASSWORD);
     assert!(result.is_err(), "modified chunk_size must be detected");
+}
+
+// ===========================================================================
+// Security: padding tamper detection
+// ===========================================================================
+
+#[test]
+fn tampered_padding_detected() {
+    let dir = tmp();
+    let input = dir.path().join("pad.bin");
+    write_random_file(&input, CHUNK_1MB as usize);
+    let enc = dir.path().join("pad.enc");
+    let dec = dir.path().join("pad.dec");
+
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+        .expect("encrypt failed");
+
+    // Write non-zero bytes into the padding region after the tag.
+    let mut data = fs::read(&enc).unwrap();
+    let padding_start = ALIGNED_HEADER_SIZE + CHUNK_1MB as usize + 16; // after ciphertext + tag
+    data[padding_start] = 0xFF;
+    data[padding_start + 1] = 0x42;
+    fs::write(&enc, &data).unwrap();
+
+    let result = engine::decrypt(&enc, &dec, PASSWORD);
+    assert!(result.is_err(), "tampered padding should be detected");
+    // Output file should have been cleaned up.
+    assert!(!dec.exists(), "partial output should be deleted on failure");
+}
+
+// ===========================================================================
+// Security: failed decryption cleans up partial output
+// ===========================================================================
+
+#[test]
+fn failed_decrypt_removes_output() {
+    let dir = tmp();
+    let input = dir.path().join("cleanup.bin");
+    write_random_file(&input, 2 * CHUNK_1MB as usize);
+    let enc = dir.path().join("cleanup.enc");
+    let dec = dir.path().join("cleanup.dec");
+
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+        .expect("encrypt failed");
+
+    let result = engine::decrypt(&enc, &dec, b"wrong-password");
+    assert!(result.is_err());
+    assert!(!dec.exists(), "output file must be removed after failed decryption");
 }

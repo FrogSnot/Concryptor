@@ -232,6 +232,7 @@ dependencies = [
  "criterion",
  "indicatif",
  "io-uring",
+ "libc",
  "rand",
  "rayon",
  "ring",
