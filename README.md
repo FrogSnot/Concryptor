@@ -1,12 +1,12 @@
 # Concryptor
 
-A multi-threaded AEAD encryption engine built in Rust. Encrypts and decrypts files at gigabyte-per-second throughput using parallel chunk processing, `pread`/`pwrite` I/O, and assembly-optimized ciphers via `ring`.
+A multi-threaded AEAD encryption engine built in Rust. Encrypts and decrypts files at gigabyte-per-second throughput using a triple-buffered `io_uring` pipeline, parallel chunk processing via Rayon, and assembly-optimized ciphers via `ring`.
 
 ## Features
 
 - **Dual cipher support**: AES-256-GCM (hardware AES-NI) and ChaCha20-Poly1305 via `ring` (assembly-optimized)
 - **Parallel encryption**: Rayon-based multi-threaded chunk processing across all CPU cores
-- **Parallel I/O**: Each thread independently reads and writes at offsets via `pread`/`pwrite`, with no memory-mapping or mmap-related limitations (no SIGBUS, no virtual address space exhaustion for large files)
+- **Triple-buffered io_uring pipeline**: Overlaps kernel I/O and CPU-side crypto using three rotating buffer pools — while one batch's writes are in-flight, the next batch is being encrypted by Rayon, and the third batch's reads are in-flight. No syscall-per-chunk overhead, no mmap limitations (no SIGBUS, no virtual address space exhaustion)
 - **Argon2id key derivation**: Industry-standard password-to-key stretching (64 MiB memory, 3 iterations)
 - **Chunk-indexed nonces**: TLS 1.3-style XOR nonce derivation prevents chunk reordering attacks
 - **Header-authenticated AAD**: The full serialized header is included in every chunk's AAD, preventing truncation and header-field manipulation attacks
@@ -25,42 +25,46 @@ Benchmarked with `cargo bench` (Criterion, 10 samples per measurement). Key deri
 - RAM: 2x 8 GiB DDR4-2666 (dual channel, 16 GiB total)
 - OS: Linux
 
-**Note on I/O:** Criterion writes temporary files to `/tmp`, which on this system is `tmpfs` (RAM-backed). Benchmark files never touch a physical disk, so results reflect cipher throughput + `pread`/`pwrite` syscall overhead, not storage bandwidth. DDR4-2666 dual-channel theoretical peak is ~40 GB/s, so memory bandwidth is not the bottleneck.
+**Note on I/O:** Criterion writes temporary files to `/tmp`, which on this system is `tmpfs` (RAM-backed). Benchmark files never touch a physical disk, so results reflect cipher throughput + `io_uring` submission/completion overhead, not storage bandwidth. DDR4-2666 dual-channel theoretical peak is ~40 GB/s, so memory bandwidth is not the bottleneck.
 
 | File Size | AES-256-GCM Encrypt | ChaCha20 Encrypt | AES-256-GCM Decrypt | ChaCha20 Decrypt |
 |-----------|--------------------:|------------------:|--------------------:|-----------------:|
-| 64 KiB    |        780 MiB/s    |      692 MiB/s    |        835 MiB/s    |      694 MiB/s   |
-| 1 MiB     |       1.50 GiB/s    |     1.14 GiB/s    |       1.53 GiB/s    |     1.13 GiB/s   |
-| 16 MiB    |       1.27 GiB/s    |     1.20 GiB/s    |       1.28 GiB/s    |     1.22 GiB/s   |
-| 64 MiB    |       1.14 GiB/s    |     1.14 GiB/s    |       1.15 GiB/s    |     1.14 GiB/s   |
-| 256 MiB   |       1.32 GiB/s    |     1.32 GiB/s    |       1.34 GiB/s    |     1.30 GiB/s   |
+| 64 KiB    |        244 MiB/s    |      233 MiB/s    |        233 MiB/s    |      234 MiB/s   |
+| 1 MiB     |       1.08 GiB/s    |      882 MiB/s    |     1010 MiB/s      |      876 MiB/s   |
+| 16 MiB    |       1.10 GiB/s    |      923 MiB/s    |       1.06 GiB/s    |      988 MiB/s   |
+| 64 MiB    |        984 MiB/s    |      935 MiB/s    |        988 MiB/s    |      973 MiB/s   |
+| 256 MiB   |       1.00 GiB/s    |     1015 MiB/s    |       1.01 GiB/s    |     1.02 GiB/s   |
 
 Chunk size sweep (AES-256-GCM, 64 MiB file):
 
 | Chunk Size | Throughput |
 |------------|----------:|
-| 64 KiB     | 2.05 GiB/s |
-| 256 KiB    | 1.98 GiB/s |
-| 1 MiB      | 1.72 GiB/s |
-| 4 MiB      | 1.12 GiB/s |
-| 8 MiB      | 1.02 GiB/s |
-| 16 MiB     | 1.04 GiB/s |
+| 64 KiB     | 1.01 GiB/s |
+| 256 KiB    | 1.05 GiB/s |
+| 1 MiB      | 1.07 GiB/s |
+| 4 MiB      |  988 MiB/s |
+| 8 MiB      |  988 MiB/s |
+| 16 MiB     | 1.00 GiB/s |
 
 ### Performance characteristics
 
-The engine uses `ring` (assembly-optimized AES-NI / NEON / ARMv8-CE) for cipher operations and `pread`/`pwrite` for parallel I/O. Each Rayon thread independently reads a chunk, encrypts/decrypts it, and writes the result — no shared mutable state, no memory mapping.
+The engine uses `ring` (assembly-optimized AES-NI / NEON / ARMv8-CE) for cipher operations and a triple-buffered `io_uring` pipeline for I/O. Three pre-allocated buffer pools rotate through the pipeline: while pool A's writes are completing in the kernel, pool B is being encrypted by Rayon on the CPU, and pool C's reads are being submitted to the kernel. This overlaps I/O latency with crypto computation.
 
 **Why AES-256-GCM is faster than ChaCha20-Poly1305 on small files:**
-`ring`'s AES-GCM backend exploits AES-NI + CLMUL hardware instructions available on x86-64, giving it a hardware advantage over ChaCha20 (which is a software cipher). At larger sizes both ciphers converge to ~1.3 GiB/s, indicating the bottleneck shifts from cipher throughput to I/O syscall overhead.
+`ring`'s AES-GCM backend exploits AES-NI + CLMUL hardware instructions available on x86-64, giving it a hardware advantage over ChaCha20 (which is a software cipher). At larger sizes both ciphers converge to ~1.0 GiB/s, indicating the bottleneck shifts from cipher throughput to I/O submission overhead.
 
-**Why peak throughput is at 1 MiB, not 256 MiB:**
-With 1 MiB total and the default 1 MiB chunk size, there's a single chunk — the Rayon `par_iter` overhead is minimal, and the entire file fits in L2 cache. At 16-64 MiB the per-chunk syscall count rises (16-64 `pread`/`pwrite` pairs) and the working set exceeds cache. At 256 MiB, Rayon's work-stealing fully saturates all cores, partially recovering throughput.
+**Why peak throughput is at 1-16 MiB, not 256 MiB:**
+Small files (1-16 MiB) have few chunks, so Rayon parallelism is efficient and the working set fits in cache. At 64-256 MiB, the io_uring pipeline is fully active (three batches in flight), but the per-SQE submission and CQE completion overhead scales with chunk count. The triple-buffer design ensures I/O and crypto overlap, partially hiding this cost.
 
-**Why ~1.3 GiB/s and not 10+ GiB/s:**
-Modern AES-NI can push 2-4 GiB/s *per core*. With 12 threads, raw cipher throughput could exceed 10 GiB/s. Two factors explain the gap:
+**Why ~1.0 GiB/s and not 10+ GiB/s:**
+Modern AES-NI can push 2-4 GiB/s *per core*. With 12 threads, raw cipher throughput could exceed 10 GiB/s. Three factors explain the gap:
 
-1. **pread/pwrite syscall overhead**: Each chunk requires two syscalls (read + write). With 256 chunks for a 256 MiB file, that's 512 kernel transitions. Unlike mmap (which amortizes page faults over large sequential accesses), pread/pwrite pays a fixed per-call cost. The tradeoff: pread/pwrite works correctly with files of any size, has no SIGBUS risk, and doesn't exhaust virtual address space.
-2. **Cache hierarchy effects**: The 5600X has 512 KiB L2 per core and 32 MiB shared L3. The default 1 MiB chunk fits in L2 for most of the encrypt/MAC pass, but 12 concurrent chunks (12 MiB active working set) compete for L3 bandwidth.
+1. **io_uring per-SQE overhead**: Each chunk requires a read SQE and a write SQE. With 256 chunks for a 256 MiB file, that's 512 SQEs submitted and 512 CQEs reaped. While io_uring avoids the per-syscall kernel transition cost of pread/pwrite, it still has ring-buffer and memory-barrier overhead per SQE.
+2. **Pipeline depth**: With `PIPELINE_DEPTH=3`, only three batches rotate through the pipeline at any time. True steady-state overlap requires at least three batches; files that fit in one or two batches don't benefit from pipelining.
+3. **Cache hierarchy effects**: The 5600X has 512 KiB L2 per core and 32 MiB shared L3. The default 4 MiB chunk exceeds L2, and a batch of ~21 chunks (84 MiB active working set) far exceeds L3. Smaller chunk sizes (64-256 KiB) show better throughput in the chunk sweep because more of the working set stays in cache.
+
+**Buffer lifecycle and safety:**
+Buffer pools are allocated once before the io_uring ring is created and are reused across all pipeline iterations without reallocation or zeroing (since io_uring reads overwrite the buffers). The ring is explicitly dropped before the buffer pools, ensuring the kernel never references freed memory (no UAF).
 
 ## Installation
 
@@ -170,6 +174,7 @@ The test suite covers:
 | Crate | Purpose |
 |-------|---------|
 | `ring` | Assembly-optimized AES-256-GCM and ChaCha20-Poly1305 AEAD |
+| `io-uring` | Linux io_uring interface for async read/write I/O |
 | `argon2` | Argon2id key derivation |
 | `rayon` | Data-parallel chunk processing |
 | `clap` | CLI argument parsing |

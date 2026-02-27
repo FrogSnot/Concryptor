@@ -7,6 +7,7 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 ring = "0.17"
+io-uring = "0.7"
 argon2 = "0.5"
 rayon = "1.10"
 clap = { version = "4", features = ["derive"] }

@@ -1,10 +1,11 @@
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
+use std::io::{Read, Write};
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
+use io_uring::{IoUring, opcode, types};
 use rand::RngCore;
 use rayon::prelude::*;
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
@@ -83,6 +84,71 @@ fn chunk_pt_len(chunk_index: u64, chunk_size: u64, total_size: u64) -> usize {
     (total_size.min(start + chunk_size) - start) as usize
 }
 
+/// Maximum buffer memory per io_uring batch (256 MiB).
+const MAX_BATCH_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Number of pipeline stages for triple-buffering.
+const PIPELINE_DEPTH: usize = 3;
+
+fn compute_batch_cap(num_chunks: usize, chunk_size: u64) -> usize {
+    let by_mem = (MAX_BATCH_BYTES / chunk_size.max(1)).max(1) as usize;
+    // Ensure at least PIPELINE_DEPTH batches so the triple-buffer can overlap.
+    let by_pipeline = (num_chunks + PIPELINE_DEPTH - 1) / PIPELINE_DEPTH;
+    num_chunks.min(by_mem).min(by_pipeline).min(4096).max(1)
+}
+
+/// Drain CQEs, routing completions to per-slot counters via user_data tags.
+/// Each SQE is tagged as `(TAG_READ|TAG_WRITE) | slot_index`.
+/// Waits until `pending[target_slot]` reaches zero.
+const TAG_READ: u64 = 0;
+const TAG_WRITE: u64 = 1 << 32;
+const TAG_MASK: u64 = 1 << 32;
+
+fn drain_slot(
+    ring: &mut IoUring,
+    pending: &mut [usize; PIPELINE_DEPTH],
+    target_slot: usize,
+) -> Result<()> {
+    while pending[target_slot] > 0 {
+        ring.submit_and_wait(1)?;
+        for cqe in ring.completion() {
+            if cqe.result() < 0 {
+                bail!(
+                    "io_uring I/O error: {}",
+                    std::io::Error::from_raw_os_error(-cqe.result())
+                );
+            }
+            let slot = (cqe.user_data() & !TAG_MASK) as usize;
+            if slot < PIPELINE_DEPTH {
+                pending[slot] = pending[slot].saturating_sub(1);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pre-allocated reusable buffer pool for one pipeline slot.
+/// Each slot holds `batch_cap` chunk buffers of `buf_size` bytes each.
+struct SlotPool {
+    bufs: Vec<Vec<u8>>,
+    count: usize,
+}
+
+impl SlotPool {
+    fn new(count: usize, buf_size: usize) -> Self {
+        let bufs = (0..count).map(|_| vec![0u8; buf_size]).collect();
+        Self { bufs, count }
+    }
+
+    /// Reclaim all buffers for the next batch without reallocating.
+    /// Only needed if the new batch has fewer chunks (the last batch).
+    fn prepare(&mut self, needed: usize) {
+        debug_assert!(needed <= self.count);
+        // No alloc, no zeroing: we'll overwrite with io_uring reads anyway.
+        let _ = needed;
+    }
+}
+
 pub fn encrypt(
     input_path: &Path,
     output_path: &Path,
@@ -123,8 +189,9 @@ pub fn encrypt(
 }
 
 /// Encrypt using a pre-built cipher. Skips Argon2 key derivation.
-/// Each chunk is processed independently via pread/pwrite for fully
-/// parallel I/O without memory-mapping.
+/// Uses a triple-buffered pipeline: while batch N's writes are in-flight
+/// and batch N+2's reads are in-flight, batch N+1 is being encrypted by Rayon.
+/// Buffers are pre-allocated once and reused across all batches.
 pub fn encrypt_with_cipher(
     input_path: &Path,
     output_path: &Path,
@@ -152,57 +219,123 @@ pub fn encrypt_with_cipher(
     let mut header_bytes = [0u8; HEADER_SIZE];
     header.serialize(&mut header_bytes);
 
-    let output_file = OpenOptions::new()
+    let mut output_file = OpenOptions::new()
         .read(true).write(true).create(true).truncate(true)
         .open(output_path)
         .with_context(|| format!("cannot create output: {}", output_path.display()))?;
     output_file.set_len(output_size)?;
-    output_file.write_all_at(&header_bytes, 0)?;
+    output_file.write_all(&header_bytes)?;
+
+    let input_fd = types::Fd(input_file.as_raw_fd());
+    let output_fd = types::Fd(output_file.as_raw_fd());
+    let batch_cap = compute_batch_cap(num_chunks, cs);
+    let buf_size = cs as usize + TAG_SIZE;
+
+    // Pre-allocate buffer pools BEFORE the ring so they outlive it (no UAF).
+    let mut slots: Vec<SlotPool> = (0..PIPELINE_DEPTH)
+        .map(|_| SlotPool::new(batch_cap, buf_size))
+        .collect();
+    let mut ring = IoUring::new((batch_cap * 2) as u32)
+        .context("failed to create io_uring instance")?;
 
     let pb = make_progress_bar(num_chunks as u64, "Encrypting");
-    let failed = AtomicBool::new(false);
+    let num_batches = (num_chunks + batch_cap - 1) / batch_cap;
 
-    (0..num_chunks).into_par_iter().for_each(|i| {
-        if failed.load(Ordering::Relaxed) { return; }
+    // Per-slot pending CQE counters, routed via user_data tags.
+    let mut pending: [usize; PIPELINE_DEPTH] = [0; PIPELINE_DEPTH];
 
-        let global_i = i as u64;
-        let pt_len = chunk_pt_len(global_i, cs, input_len);
-        let mut buf = vec![0u8; pt_len + TAG_SIZE];
+    for step in 0..num_batches + 2 {
+        let write_slot = step % PIPELINE_DEPTH;
+        let crypto_slot = (step + 1) % PIPELINE_DEPTH;
+        let read_slot = (step + 2) % PIPELINE_DEPTH;
+        let read_batch = step;
+        let crypto_batch = step.wrapping_sub(1);
+        let write_batch = step.wrapping_sub(2);
 
-        // pread plaintext chunk from input
-        if pt_len > 0 {
-            let input_offset = global_i * cs;
-            if input_file.read_exact_at(&mut buf[..pt_len], input_offset).is_err() {
-                failed.store(true, Ordering::Relaxed);
-                return;
+        // 1. Wait for previous writes on write_slot to complete.
+        if step >= 2 && write_batch < num_batches {
+            drain_slot(&mut ring, &mut pending, write_slot)?;
+            let ws = write_batch * batch_cap;
+            let we = (ws + batch_cap).min(num_chunks);
+            pb.inc((we - ws) as u64);
+        }
+
+        // 2. Submit reads for read_batch into read_slot.
+        if read_batch < num_batches {
+            let rs = read_batch * batch_cap;
+            let re = (rs + batch_cap).min(num_chunks);
+            slots[read_slot].prepare(re - rs);
+
+            {
+                let mut sq = ring.submission();
+                for (j, i) in (rs..re).enumerate() {
+                    let pt_len = chunk_pt_len(i as u64, cs, input_len);
+                    if pt_len > 0 {
+                        let sqe = opcode::Read::new(
+                            input_fd,
+                            slots[read_slot].bufs[j].as_mut_ptr(),
+                            pt_len as u32,
+                        )
+                        .offset(i as u64 * cs)
+                        .build()
+                        .user_data(TAG_READ | read_slot as u64);
+                        unsafe { sq.push(&sqe).expect("SQ full"); }
+                        pending[read_slot] += 1;
+                    }
+                }
+            }
+            if pending[read_slot] > 0 {
+                ring.submit()?;
             }
         }
 
-        // Encrypt in-place, get detached tag
-        let nonce_bytes = derive_nonce(&base_nonce, global_i);
-        let is_final = global_i == last_chunk_idx;
-        let aad = build_aad(&header_bytes, global_i, is_final);
+        // 3. Wait for reads on crypto_slot, then encrypt in parallel.
+        if step >= 1 && crypto_batch < num_batches {
+            drain_slot(&mut ring, &mut pending, crypto_slot)?;
 
-        match cipher.encrypt_chunk(&nonce_bytes, &aad, &mut buf[..pt_len]) {
-            Ok(tag) => buf[pt_len..pt_len + TAG_SIZE].copy_from_slice(&tag),
-            Err(_) => { failed.store(true, Ordering::Relaxed); return; }
+            let cs_start = crypto_batch * batch_cap;
+            let cs_end = (cs_start + batch_cap).min(num_chunks);
+            let batch_len = cs_end - cs_start;
+
+            slots[crypto_slot].bufs[..batch_len]
+                .par_iter_mut()
+                .enumerate()
+                .try_for_each(|(j, buf)| -> Result<()> {
+                    let i = (cs_start + j) as u64;
+                    let pt_len = chunk_pt_len(i, cs, input_len);
+                    let nonce = derive_nonce(&base_nonce, i);
+                    let is_final = i == last_chunk_idx;
+                    let aad = build_aad(&header_bytes, i, is_final);
+                    let tag = cipher.encrypt_chunk(&nonce, &aad, &mut buf[..pt_len])?;
+                    buf[pt_len..pt_len + TAG_SIZE].copy_from_slice(&tag);
+                    Ok(())
+                })?;
+
+            // Submit writes for the just-encrypted batch.
+            {
+                let mut sq = ring.submission();
+                for (j, i) in (cs_start..cs_end).enumerate() {
+                    let write_len = (chunk_pt_len(i as u64, cs, input_len) + TAG_SIZE) as u32;
+                    let out_off = HEADER_SIZE as u64 + i as u64 * chunk_enc_size;
+                    let sqe = opcode::Write::new(
+                        output_fd,
+                        slots[crypto_slot].bufs[j].as_ptr(),
+                        write_len,
+                    )
+                    .offset(out_off)
+                    .build()
+                    .user_data(TAG_WRITE | crypto_slot as u64);
+                    unsafe { sq.push(&sqe).expect("SQ full"); }
+                    pending[crypto_slot] += 1;
+                }
+            }
+            ring.submit()?;
         }
-
-        // pwrite ciphertext + tag to output
-        let output_offset = HEADER_SIZE as u64 + global_i * chunk_enc_size;
-        if output_file.write_all_at(&buf[..pt_len + TAG_SIZE], output_offset).is_err() {
-            failed.store(true, Ordering::Relaxed);
-        }
-
-        pb.inc(1);
-    });
-
-    pb.finish_with_message("done");
-
-    if failed.load(Ordering::Relaxed) {
-        bail!("encryption failed on one or more chunks");
     }
 
+    pb.finish_with_message("done");
+    drop(ring);
+    drop(slots);
     Ok(())
 }
 
@@ -211,7 +344,7 @@ pub fn decrypt(
     output_path: &Path,
     password: &[u8],
 ) -> Result<()> {
-    let input_file = File::open(input_path)
+    let mut input_file = File::open(input_path)
         .with_context(|| format!("cannot open input: {}", input_path.display()))?;
     let input_len = input_file.metadata()?.len();
 
@@ -220,7 +353,7 @@ pub fn decrypt(
     }
 
     let mut header_bytes = [0u8; HEADER_SIZE];
-    input_file.read_exact_at(&mut header_bytes, 0)?;
+    input_file.read_exact(&mut header_bytes)?;
     let header = Header::deserialize(&header_bytes)?;
 
     let expected = Header::output_size(header.original_size, header.chunk_size);
@@ -251,14 +384,14 @@ pub fn decrypt(
 }
 
 /// Decrypt using a pre-built cipher. Skips Argon2 key derivation.
-/// Reads header from the encrypted file to determine chunk layout,
-/// then processes in batches with parallel decryption per batch.
+/// Uses a triple-buffered pipeline: overlapped io_uring reads/writes
+/// with parallel Rayon decryption. Buffers pre-allocated once.
 pub fn decrypt_with_cipher(
     input_path: &Path,
     output_path: &Path,
     cipher: &Cipher,
 ) -> Result<()> {
-    let input_file = File::open(input_path)
+    let mut input_file = File::open(input_path)
         .with_context(|| format!("cannot open input: {}", input_path.display()))?;
     let input_len = input_file.metadata()?.len();
 
@@ -266,9 +399,8 @@ pub fn decrypt_with_cipher(
         bail!("file too small to be a valid Concryptor file");
     }
 
-    // Read header via standard read (only 52 bytes)
     let mut header_bytes = [0u8; HEADER_SIZE];
-    input_file.read_exact_at(&mut header_bytes, 0)?;
+    input_file.read_exact(&mut header_bytes)?;
     let header = Header::deserialize(&header_bytes)?;
 
     let expected = Header::output_size(header.original_size, header.chunk_size);
@@ -290,54 +422,113 @@ pub fn decrypt_with_cipher(
         .with_context(|| format!("cannot create output: {}", output_path.display()))?;
     output_file.set_len(header.original_size)?;
 
+    let input_fd = types::Fd(input_file.as_raw_fd());
+    let output_fd = types::Fd(output_file.as_raw_fd());
+    let batch_cap = compute_batch_cap(num_chunks, cs);
+    let buf_size = cs as usize + TAG_SIZE;
+
+    let mut slots: Vec<SlotPool> = (0..PIPELINE_DEPTH)
+        .map(|_| SlotPool::new(batch_cap, buf_size))
+        .collect();
+    let mut ring = IoUring::new((batch_cap * 2) as u32)
+        .context("failed to create io_uring instance")?;
+
     let pb = make_progress_bar(num_chunks as u64, "Decrypting");
-    let failed = AtomicBool::new(false);
+    let num_batches = (num_chunks + batch_cap - 1) / batch_cap;
 
-    (0..num_chunks).into_par_iter().for_each(|i| {
-        if failed.load(Ordering::Relaxed) { return; }
+    let mut pending: [usize; PIPELINE_DEPTH] = [0; PIPELINE_DEPTH];
 
-        let global_i = i as u64;
-        let pt_len = chunk_pt_len(global_i, cs, header.original_size);
-        let enc_len = pt_len + TAG_SIZE;
-        let mut buf = vec![0u8; enc_len];
+    for step in 0..num_batches + 2 {
+        let write_slot = step % PIPELINE_DEPTH;
+        let crypto_slot = (step + 1) % PIPELINE_DEPTH;
+        let read_slot = (step + 2) % PIPELINE_DEPTH;
+        let read_batch = step;
+        let crypto_batch = step.wrapping_sub(1);
+        let write_batch = step.wrapping_sub(2);
 
-        // pread encrypted chunk (ciphertext || tag) from input
-        let input_offset = HEADER_SIZE as u64 + global_i * chunk_enc_size;
-        if input_file.read_exact_at(&mut buf, input_offset).is_err() {
-            failed.store(true, Ordering::Relaxed);
-            return;
+        // 1. Drain writes from the oldest slot.
+        if step >= 2 && write_batch < num_batches {
+            drain_slot(&mut ring, &mut pending, write_slot)?;
+            let ws = write_batch * batch_cap;
+            let we = (ws + batch_cap).min(num_chunks);
+            pb.inc((we - ws) as u64);
         }
 
-        // Decrypt in-place (ring expects ciphertext || tag)
-        let nonce_bytes = derive_nonce(&header.base_nonce, global_i);
-        let is_final = global_i == last_chunk_idx;
-        let aad = build_aad(&header_bytes, global_i, is_final);
+        // 2. Submit reads for read_batch into read_slot.
+        if read_batch < num_batches {
+            let rs = read_batch * batch_cap;
+            let re = (rs + batch_cap).min(num_chunks);
+            slots[read_slot].prepare(re - rs);
 
-        if cipher.decrypt_chunk(&nonce_bytes, &aad, &mut buf).is_err() {
-            failed.store(true, Ordering::Relaxed);
-            return;
+            {
+                let mut sq = ring.submission();
+                for (j, i) in (rs..re).enumerate() {
+                    let enc_len = (chunk_pt_len(i as u64, cs, header.original_size) + TAG_SIZE) as u32;
+                    let in_off = HEADER_SIZE as u64 + i as u64 * chunk_enc_size;
+                    let sqe = opcode::Read::new(
+                        input_fd,
+                        slots[read_slot].bufs[j].as_mut_ptr(),
+                        enc_len,
+                    )
+                    .offset(in_off)
+                    .build()
+                    .user_data(TAG_READ | read_slot as u64);
+                    unsafe { sq.push(&sqe).expect("SQ full"); }
+                    pending[read_slot] += 1;
+                }
+            }
+            ring.submit()?;
         }
 
-        // pwrite plaintext to output (strip the tag)
-        if pt_len > 0 {
-            let output_offset = global_i * cs;
-            if output_file.write_all_at(&buf[..pt_len], output_offset).is_err() {
-                failed.store(true, Ordering::Relaxed);
+        // 3. Wait for reads on crypto_slot, decrypt, submit writes.
+        if step >= 1 && crypto_batch < num_batches {
+            drain_slot(&mut ring, &mut pending, crypto_slot)?;
+
+            let cs_start = crypto_batch * batch_cap;
+            let cs_end = (cs_start + batch_cap).min(num_chunks);
+            let batch_len = cs_end - cs_start;
+
+            slots[crypto_slot].bufs[..batch_len]
+                .par_iter_mut()
+                .enumerate()
+                .try_for_each(|(j, buf)| {
+                    let i = (cs_start + j) as u64;
+                    let pt_len = chunk_pt_len(i, cs, header.original_size);
+                    let nonce = derive_nonce(&header.base_nonce, i);
+                    let is_final = i == last_chunk_idx;
+                    let aad = build_aad(&header_bytes, i, is_final);
+                    cipher.decrypt_chunk(&nonce, &aad, &mut buf[..pt_len + TAG_SIZE])
+                })?;
+
+            // Submit writes for plaintext.
+            {
+                let mut sq = ring.submission();
+                for (j, i) in (cs_start..cs_end).enumerate() {
+                    let pt_len = chunk_pt_len(i as u64, cs, header.original_size);
+                    if pt_len > 0 {
+                        let out_off = i as u64 * cs;
+                        let sqe = opcode::Write::new(
+                            output_fd,
+                            slots[crypto_slot].bufs[j].as_ptr(),
+                            pt_len as u32,
+                        )
+                        .offset(out_off)
+                        .build()
+                        .user_data(TAG_WRITE | crypto_slot as u64);
+                        unsafe { sq.push(&sqe).expect("SQ full"); }
+                        pending[crypto_slot] += 1;
+                    }
+                }
+            }
+            if pending[crypto_slot] > 0 {
+                ring.submit()?;
             }
         }
-
-        pb.inc(1);
-    });
-
-    pb.finish_with_message("done");
-
-    if failed.load(Ordering::Relaxed) {
-        bail!(
-            "decryption failed: authentication error on one or more chunks. \
-             Wrong password, or file has been tampered with."
-        );
     }
 
+    pb.finish_with_message("done");
+    drop(ring);
+    drop(slots);
     Ok(())
 }
 
