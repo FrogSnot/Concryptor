@@ -1,0 +1,609 @@
+use std::fs;
+use std::path::Path;
+
+use concryptor::crypto::{derive_key, derive_nonce};
+use concryptor::engine;
+use concryptor::header::{CipherType, Header, HEADER_SIZE, NONCE_LEN, SALT_LEN, TAG_SIZE};
+use rand::RngCore;
+use sha2::{Digest, Sha256};
+use tempfile::TempDir;
+
+const PASSWORD: &[u8] = b"test-password-for-concryptor";
+const CHUNK_1MB: u32 = 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn tmp() -> TempDir {
+    tempfile::tempdir().expect("failed to create temp dir")
+}
+
+fn write_random_file(path: &Path, size: usize) {
+    let mut rng = rand::thread_rng();
+    let mut buf = vec![0u8; size];
+    rng.fill_bytes(&mut buf);
+    fs::write(path, &buf).expect("write failed");
+}
+
+fn write_pattern_file(path: &Path, size: usize) {
+    let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+    fs::write(path, &data).expect("write failed");
+}
+
+fn sha256(path: &Path) -> [u8; 32] {
+    let data = fs::read(path).expect("read failed");
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    hasher.finalize().into()
+}
+
+fn roundtrip(
+    input_path: &Path,
+    enc_path: &Path,
+    dec_path: &Path,
+    cipher: CipherType,
+    chunk_size: u32,
+) {
+    engine::encrypt(input_path, enc_path, PASSWORD, cipher, Some(chunk_size))
+        .expect("encrypt failed");
+    engine::decrypt(enc_path, dec_path, PASSWORD)
+        .expect("decrypt failed");
+    assert_eq!(sha256(input_path), sha256(dec_path), "roundtrip mismatch");
+}
+
+// ===========================================================================
+// Header tests
+// ===========================================================================
+
+#[test]
+fn header_serialize_deserialize_roundtrip() {
+    let salt = [0xAA; SALT_LEN];
+    let nonce = [0xBB; NONCE_LEN];
+    let header = Header::new(CipherType::Aes256Gcm, 4 * 1024 * 1024, 123456789, salt, nonce);
+
+    let mut buf = [0u8; HEADER_SIZE];
+    header.serialize(&mut buf);
+    let parsed = Header::deserialize(&buf).unwrap();
+
+    assert_eq!(parsed.cipher, CipherType::Aes256Gcm);
+    assert_eq!(parsed.chunk_size, 4 * 1024 * 1024);
+    assert_eq!(parsed.original_size, 123456789);
+    assert_eq!(parsed.salt, salt);
+    assert_eq!(parsed.base_nonce, nonce);
+}
+
+#[test]
+fn header_deserialize_rejects_bad_magic() {
+    let mut buf = [0u8; HEADER_SIZE];
+    buf[..10].copy_from_slice(b"NOTCONCRYP");
+    assert!(Header::deserialize(&buf).is_err());
+}
+
+#[test]
+fn header_deserialize_rejects_short_buffer() {
+    let buf = [0u8; 10];
+    assert!(Header::deserialize(&buf).is_err());
+}
+
+#[test]
+fn header_output_size_calculation() {
+    // 10 MB file, 4 MB chunks -> 3 chunks (4+4+2)
+    let size = Header::output_size(10 * 1024 * 1024, 4 * 1024 * 1024);
+    let expected = HEADER_SIZE as u64 + 10 * 1024 * 1024 + 3 * TAG_SIZE as u64;
+    assert_eq!(size, expected);
+}
+
+#[test]
+fn header_output_size_empty_file() {
+    let size = Header::output_size(0, 4 * 1024 * 1024);
+    // Empty file still has 1 chunk (the empty chunk)
+    let expected = HEADER_SIZE as u64 + 0 + 1 * TAG_SIZE as u64;
+    assert_eq!(size, expected);
+}
+
+#[test]
+fn header_num_chunks_exact_multiple() {
+    assert_eq!(Header::num_chunks(8 * 1024 * 1024, 4 * 1024 * 1024), 2);
+}
+
+#[test]
+fn header_num_chunks_with_remainder() {
+    assert_eq!(Header::num_chunks(9 * 1024 * 1024, 4 * 1024 * 1024), 3);
+}
+
+// ===========================================================================
+// Crypto tests
+// ===========================================================================
+
+#[test]
+fn derive_key_deterministic() {
+    let k1 = derive_key(b"password", &[1u8; 16]).unwrap();
+    let k2 = derive_key(b"password", &[1u8; 16]).unwrap();
+    assert_eq!(k1, k2);
+}
+
+#[test]
+fn derive_key_different_salt_yields_different_key() {
+    let k1 = derive_key(b"password", &[1u8; 16]).unwrap();
+    let k2 = derive_key(b"password", &[2u8; 16]).unwrap();
+    assert_ne!(k1, k2);
+}
+
+#[test]
+fn derive_key_different_password_yields_different_key() {
+    let k1 = derive_key(b"alpha", &[0u8; 16]).unwrap();
+    let k2 = derive_key(b"bravo", &[0u8; 16]).unwrap();
+    assert_ne!(k1, k2);
+}
+
+#[test]
+fn derive_nonce_unique_per_index() {
+    let base = [0xCC; NONCE_LEN];
+    let n0 = derive_nonce(&base, 0);
+    let n1 = derive_nonce(&base, 1);
+    let n2 = derive_nonce(&base, 1000);
+    assert_ne!(n0, n1);
+    assert_ne!(n1, n2);
+    assert_ne!(n0, n2);
+}
+
+#[test]
+fn derive_nonce_index_zero_preserves_base() {
+    let base = [0x42; NONCE_LEN];
+    let n = derive_nonce(&base, 0);
+    // XOR with 0 should return the base nonce unchanged
+    assert_eq!(n, base);
+}
+
+// ===========================================================================
+// Roundtrip: AES-256-GCM
+// ===========================================================================
+
+#[test]
+fn aes_roundtrip_empty_file() {
+    let dir = tmp();
+    let input = dir.path().join("empty.bin");
+    fs::write(&input, b"").unwrap();
+    let enc = dir.path().join("empty.enc");
+    let dec = dir.path().join("empty.dec");
+    roundtrip(&input, &enc, &dec, CipherType::Aes256Gcm, CHUNK_1MB);
+    assert_eq!(fs::read(&dec).unwrap().len(), 0);
+}
+
+#[test]
+fn aes_roundtrip_1_byte() {
+    let dir = tmp();
+    let input = dir.path().join("one.bin");
+    fs::write(&input, &[0xFF]).unwrap();
+    let enc = dir.path().join("one.enc");
+    let dec = dir.path().join("one.dec");
+    roundtrip(&input, &enc, &dec, CipherType::Aes256Gcm, CHUNK_1MB);
+}
+
+#[test]
+fn aes_roundtrip_exactly_one_chunk() {
+    let dir = tmp();
+    let input = dir.path().join("exact.bin");
+    write_random_file(&input, CHUNK_1MB as usize);
+    let enc = dir.path().join("exact.enc");
+    let dec = dir.path().join("exact.dec");
+    roundtrip(&input, &enc, &dec, CipherType::Aes256Gcm, CHUNK_1MB);
+}
+
+#[test]
+fn aes_roundtrip_chunk_boundary_minus_one() {
+    let dir = tmp();
+    let input = dir.path().join("boundary_m1.bin");
+    write_random_file(&input, CHUNK_1MB as usize - 1);
+    let enc = dir.path().join("boundary_m1.enc");
+    let dec = dir.path().join("boundary_m1.dec");
+    roundtrip(&input, &enc, &dec, CipherType::Aes256Gcm, CHUNK_1MB);
+}
+
+#[test]
+fn aes_roundtrip_chunk_boundary_plus_one() {
+    let dir = tmp();
+    let input = dir.path().join("boundary_p1.bin");
+    write_random_file(&input, CHUNK_1MB as usize + 1);
+    let enc = dir.path().join("boundary_p1.enc");
+    let dec = dir.path().join("boundary_p1.dec");
+    roundtrip(&input, &enc, &dec, CipherType::Aes256Gcm, CHUNK_1MB);
+}
+
+#[test]
+fn aes_roundtrip_multi_chunk() {
+    let dir = tmp();
+    let input = dir.path().join("multi.bin");
+    write_random_file(&input, 5 * CHUNK_1MB as usize + 12345);
+    let enc = dir.path().join("multi.enc");
+    let dec = dir.path().join("multi.dec");
+    roundtrip(&input, &enc, &dec, CipherType::Aes256Gcm, CHUNK_1MB);
+}
+
+#[test]
+fn aes_roundtrip_pattern_data() {
+    let dir = tmp();
+    let input = dir.path().join("pattern.bin");
+    write_pattern_file(&input, 3 * CHUNK_1MB as usize);
+    let enc = dir.path().join("pattern.enc");
+    let dec = dir.path().join("pattern.dec");
+    roundtrip(&input, &enc, &dec, CipherType::Aes256Gcm, CHUNK_1MB);
+}
+
+#[test]
+fn aes_roundtrip_small_chunk_size() {
+    let dir = tmp();
+    let input = dir.path().join("small_chunk.bin");
+    // 256 KiB file with 64 KiB chunks -> 4 chunks
+    write_random_file(&input, 256 * 1024);
+    let enc = dir.path().join("small_chunk.enc");
+    let dec = dir.path().join("small_chunk.dec");
+    roundtrip(&input, &enc, &dec, CipherType::Aes256Gcm, 64 * 1024);
+}
+
+// ===========================================================================
+// Roundtrip: ChaCha20-Poly1305
+// ===========================================================================
+
+#[test]
+fn chacha_roundtrip_empty_file() {
+    let dir = tmp();
+    let input = dir.path().join("empty.bin");
+    fs::write(&input, b"").unwrap();
+    let enc = dir.path().join("empty.enc");
+    let dec = dir.path().join("empty.dec");
+    roundtrip(&input, &enc, &dec, CipherType::ChaCha20Poly1305, CHUNK_1MB);
+}
+
+#[test]
+fn chacha_roundtrip_multi_chunk() {
+    let dir = tmp();
+    let input = dir.path().join("multi.bin");
+    write_random_file(&input, 3 * CHUNK_1MB as usize + 999);
+    let enc = dir.path().join("multi.enc");
+    let dec = dir.path().join("multi.dec");
+    roundtrip(&input, &enc, &dec, CipherType::ChaCha20Poly1305, CHUNK_1MB);
+}
+
+#[test]
+fn chacha_roundtrip_small_chunks() {
+    let dir = tmp();
+    let input = dir.path().join("small.bin");
+    write_random_file(&input, 128 * 1024);
+    let enc = dir.path().join("small.enc");
+    let dec = dir.path().join("small.dec");
+    roundtrip(&input, &enc, &dec, CipherType::ChaCha20Poly1305, 32 * 1024);
+}
+
+// ===========================================================================
+// Security: wrong password must fail
+// ===========================================================================
+
+#[test]
+fn wrong_password_fails_aes() {
+    let dir = tmp();
+    let input = dir.path().join("secret.bin");
+    write_random_file(&input, CHUNK_1MB as usize);
+    let enc = dir.path().join("secret.enc");
+    let dec = dir.path().join("secret.dec");
+
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+        .expect("encrypt failed");
+
+    let result = engine::decrypt(&enc, &dec, b"wrong-password");
+    assert!(result.is_err(), "decryption with wrong password should fail");
+}
+
+#[test]
+fn wrong_password_fails_chacha() {
+    let dir = tmp();
+    let input = dir.path().join("secret.bin");
+    write_random_file(&input, CHUNK_1MB as usize);
+    let enc = dir.path().join("secret.enc");
+    let dec = dir.path().join("secret.dec");
+
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::ChaCha20Poly1305, Some(CHUNK_1MB))
+        .expect("encrypt failed");
+
+    let result = engine::decrypt(&enc, &dec, b"wrong-password");
+    assert!(result.is_err(), "decryption with wrong password should fail");
+}
+
+// ===========================================================================
+// Security: tamper detection
+// ===========================================================================
+
+#[test]
+fn tampered_ciphertext_detected() {
+    let dir = tmp();
+    let input = dir.path().join("secret.bin");
+    write_random_file(&input, 2 * CHUNK_1MB as usize);
+    let enc = dir.path().join("secret.enc");
+    let dec = dir.path().join("secret.dec");
+
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+        .expect("encrypt failed");
+
+    // Flip a byte in the middle of the ciphertext body
+    let mut data = fs::read(&enc).unwrap();
+    let mid = HEADER_SIZE + data.len() / 2;
+    data[mid] ^= 0xFF;
+    fs::write(&enc, &data).unwrap();
+
+    let result = engine::decrypt(&enc, &dec, PASSWORD);
+    assert!(result.is_err(), "tampered file should fail authentication");
+}
+
+#[test]
+fn tampered_tag_detected() {
+    let dir = tmp();
+    let input = dir.path().join("secret.bin");
+    write_random_file(&input, CHUNK_1MB as usize);
+    let enc = dir.path().join("secret.enc");
+    let dec = dir.path().join("secret.dec");
+
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+        .expect("encrypt failed");
+
+    // Corrupt the last byte (inside the tag of the only chunk)
+    let mut data = fs::read(&enc).unwrap();
+    let last = data.len() - 1;
+    data[last] ^= 0x01;
+    fs::write(&enc, &data).unwrap();
+
+    let result = engine::decrypt(&enc, &dec, PASSWORD);
+    assert!(result.is_err(), "tampered tag should fail authentication");
+}
+
+#[test]
+fn tampered_header_salt_detected() {
+    let dir = tmp();
+    let input = dir.path().join("secret.bin");
+    write_random_file(&input, CHUNK_1MB as usize);
+    let enc = dir.path().join("secret.enc");
+    let dec = dir.path().join("secret.dec");
+
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+        .expect("encrypt failed");
+
+    // Flip a byte in the salt region of the header
+    let mut data = fs::read(&enc).unwrap();
+    // Salt starts at offset 24 (10 magic + 1 ver + 1 cipher + 4 chunk + 8 origsize)
+    data[24] ^= 0xFF;
+    fs::write(&enc, &data).unwrap();
+
+    let result = engine::decrypt(&enc, &dec, PASSWORD);
+    assert!(result.is_err(), "corrupted salt should cause key mismatch");
+}
+
+#[test]
+fn truncated_file_detected() {
+    let dir = tmp();
+    let input = dir.path().join("secret.bin");
+    write_random_file(&input, CHUNK_1MB as usize);
+    let enc = dir.path().join("secret.enc");
+    let dec = dir.path().join("secret.dec");
+
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+        .expect("encrypt failed");
+
+    // Truncate the encrypted file
+    let data = fs::read(&enc).unwrap();
+    fs::write(&enc, &data[..data.len() - 100]).unwrap();
+
+    let result = engine::decrypt(&enc, &dec, PASSWORD);
+    assert!(result.is_err(), "truncated file should be detected");
+}
+
+// ===========================================================================
+// Security: chunk reordering attack
+// ===========================================================================
+
+#[test]
+fn chunk_swap_attack_detected() {
+    let dir = tmp();
+    let input = dir.path().join("secret.bin");
+    // 2 full chunks
+    write_random_file(&input, 2 * CHUNK_1MB as usize);
+    let enc = dir.path().join("secret.enc");
+    let dec = dir.path().join("secret.dec");
+
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+        .expect("encrypt failed");
+
+    let mut data = fs::read(&enc).unwrap();
+    let chunk_enc_size = CHUNK_1MB as usize + TAG_SIZE;
+
+    // Swap chunk 0 and chunk 1 in the body
+    let body_start = HEADER_SIZE;
+    let chunk0 = data[body_start..body_start + chunk_enc_size].to_vec();
+    let chunk1 = data[body_start + chunk_enc_size..body_start + 2 * chunk_enc_size].to_vec();
+    data[body_start..body_start + chunk_enc_size].copy_from_slice(&chunk1);
+    data[body_start + chunk_enc_size..body_start + 2 * chunk_enc_size].copy_from_slice(&chunk0);
+    fs::write(&enc, &data).unwrap();
+
+    let result = engine::decrypt(&enc, &dec, PASSWORD);
+    assert!(result.is_err(), "chunk swap should be detected by nonce+AAD binding");
+}
+
+// ===========================================================================
+// Encrypted file structure validation
+// ===========================================================================
+
+#[test]
+fn encrypted_file_has_correct_size() {
+    let dir = tmp();
+    let input = dir.path().join("sized.bin");
+    let size = 3 * CHUNK_1MB as usize + 500;
+    write_random_file(&input, size);
+    let enc = dir.path().join("sized.enc");
+
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+        .expect("encrypt failed");
+
+    let expected = Header::output_size(size as u64, CHUNK_1MB);
+    let actual = fs::metadata(&enc).unwrap().len();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn encrypted_file_header_readable() {
+    let dir = tmp();
+    let input = dir.path().join("readable.bin");
+    write_random_file(&input, 1000);
+    let enc = dir.path().join("readable.enc");
+
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::ChaCha20Poly1305, Some(CHUNK_1MB))
+        .expect("encrypt failed");
+
+    let data = fs::read(&enc).unwrap();
+    let header = Header::deserialize(&data[..HEADER_SIZE]).unwrap();
+    assert_eq!(header.cipher, CipherType::ChaCha20Poly1305);
+    assert_eq!(header.chunk_size, CHUNK_1MB);
+    assert_eq!(header.original_size, 1000);
+}
+
+// ===========================================================================
+// Edge case: same file encrypted twice produces different ciphertext
+// ===========================================================================
+
+#[test]
+fn encryption_is_non_deterministic() {
+    let dir = tmp();
+    let input = dir.path().join("ndet.bin");
+    write_pattern_file(&input, 4096);
+    let enc1 = dir.path().join("ndet1.enc");
+    let enc2 = dir.path().join("ndet2.enc");
+
+    engine::encrypt(&input, &enc1, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB)).unwrap();
+    engine::encrypt(&input, &enc2, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB)).unwrap();
+
+    let d1 = fs::read(&enc1).unwrap();
+    let d2 = fs::read(&enc2).unwrap();
+    // Salt and nonce are random, so content must differ
+    assert_ne!(d1, d2, "encrypting the same file twice should produce different output");
+}
+
+// ===========================================================================
+// Cross-cipher: AES encrypted file must not decrypt if header says ChaCha
+// ===========================================================================
+
+#[test]
+fn cipher_type_mismatch_fails() {
+    let dir = tmp();
+    let input = dir.path().join("cross.bin");
+    write_random_file(&input, CHUNK_1MB as usize);
+    let enc = dir.path().join("cross.enc");
+    let dec = dir.path().join("cross.dec");
+
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB)).unwrap();
+
+    // Overwrite the cipher byte in the header to claim it's ChaCha20
+    let mut data = fs::read(&enc).unwrap();
+    data[11] = CipherType::ChaCha20Poly1305 as u8; // byte 11 = cipher type
+    fs::write(&enc, &data).unwrap();
+
+    let result = engine::decrypt(&enc, &dec, PASSWORD);
+    assert!(result.is_err(), "cipher type mismatch should fail decryption");
+}
+
+// ===========================================================================
+// Stress: many small chunks
+// ===========================================================================
+
+#[test]
+fn many_small_chunks() {
+    let dir = tmp();
+    let input = dir.path().join("many.bin");
+    // 1 MiB file with 4 KiB chunks -> 256 chunks
+    write_random_file(&input, 1024 * 1024);
+    let enc = dir.path().join("many.enc");
+    let dec = dir.path().join("many.dec");
+    roundtrip(&input, &enc, &dec, CipherType::Aes256Gcm, 4 * 1024);
+}
+
+// ===========================================================================
+// Security: truncation attack (header original_size manipulation)
+// ===========================================================================
+
+#[test]
+fn truncation_attack_modify_original_size_detected() {
+    let dir = tmp();
+    let input = dir.path().join("trunc.bin");
+    // 3 chunks worth of data
+    write_random_file(&input, 3 * CHUNK_1MB as usize);
+    let enc = dir.path().join("trunc.enc");
+    let dec = dir.path().join("trunc.dec");
+
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+        .expect("encrypt failed");
+
+    // Attacker modifies original_size in the header to claim only 2 chunks,
+    // then truncates the file to match the new claimed size.
+    let data = fs::read(&enc).unwrap();
+    let fake_size: u64 = 2 * CHUNK_1MB as u64;
+    let fake_file_size = HEADER_SIZE + (2 * (CHUNK_1MB as usize + TAG_SIZE));
+    let mut tampered = data[..fake_file_size].to_vec();
+    tampered[16..24].copy_from_slice(&fake_size.to_le_bytes());
+    fs::write(&enc, &tampered).unwrap();
+
+    let result = engine::decrypt(&enc, &dec, PASSWORD);
+    assert!(
+        result.is_err(),
+        "truncation attack (modified original_size) must be detected via header-bound AAD"
+    );
+}
+
+#[test]
+fn truncation_attack_remove_last_chunk_detected() {
+    let dir = tmp();
+    let input = dir.path().join("trunc2.bin");
+    // 2 full chunks
+    write_random_file(&input, 2 * CHUNK_1MB as usize);
+    let enc = dir.path().join("trunc2.enc");
+    let dec = dir.path().join("trunc2.dec");
+
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+        .expect("encrypt failed");
+
+    // Attacker removes the last chunk and adjusts header to 1 chunk.
+    let data = fs::read(&enc).unwrap();
+    let fake_size: u64 = CHUNK_1MB as u64;
+    let fake_file_size = HEADER_SIZE + (CHUNK_1MB as usize + TAG_SIZE);
+    let mut tampered = data[..fake_file_size].to_vec();
+    tampered[16..24].copy_from_slice(&fake_size.to_le_bytes());
+    fs::write(&enc, &tampered).unwrap();
+
+    let result = engine::decrypt(&enc, &dec, PASSWORD);
+    assert!(
+        result.is_err(),
+        "removing last chunk must be detected: chunk 0 was not the final chunk at encryption time"
+    );
+}
+
+// ===========================================================================
+// Security: header field manipulation
+// ===========================================================================
+
+#[test]
+fn modified_chunk_size_in_header_detected() {
+    let dir = tmp();
+    let input = dir.path().join("hdr.bin");
+    write_random_file(&input, CHUNK_1MB as usize);
+    let enc = dir.path().join("hdr.enc");
+    let dec = dir.path().join("hdr.dec");
+
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+        .expect("encrypt failed");
+
+    // Change the chunk_size field in the header (offset 12..16)
+    let mut data = fs::read(&enc).unwrap();
+    let new_cs: u32 = 512 * 1024;
+    data[12..16].copy_from_slice(&new_cs.to_le_bytes());
+    fs::write(&enc, &data).unwrap();
+
+    // File size won't match the new header's expectation, OR AAD mismatch will catch it
+    let result = engine::decrypt(&enc, &dec, PASSWORD);
+    assert!(result.is_err(), "modified chunk_size must be detected");
+}
