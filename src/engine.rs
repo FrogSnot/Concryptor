@@ -13,8 +13,8 @@ use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 
 use crate::crypto::{derive_key, derive_nonce, zeroize_key};
 use crate::header::{
-    aligned_chunk_disk_size, CipherType, Header, ALIGNED_HEADER_SIZE, HEADER_SIZE, NONCE_LEN,
-    SALT_LEN, SECTOR_SIZE, TAG_SIZE,
+    aligned_chunk_disk_size, CipherType, Header, KdfParams, ALIGNED_HEADER_SIZE, HEADER_SIZE,
+    NONCE_LEN, SALT_LEN, SECTOR_SIZE, TAG_SIZE,
 };
 
 pub const DEFAULT_CHUNK_SIZE: u32 = 4 * 1024 * 1024; // 4 MiB
@@ -227,6 +227,7 @@ pub fn encrypt(
     password: &[u8],
     cipher_type: CipherType,
     chunk_size: Option<u32>,
+    kdf_params: &KdfParams,
 ) -> Result<()> {
     let chunk_size = chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
     if chunk_size == 0 {
@@ -238,8 +239,8 @@ pub fn encrypt(
     rand::thread_rng().fill_bytes(&mut salt);
     rand::thread_rng().fill_bytes(&mut base_nonce);
 
-    eprintln!("Deriving key with Argon2id (this may take a moment)...");
-    let mut key = derive_key(password, &salt)?;
+    eprintln!("Deriving key with Argon2id ({} MiB, {} iterations)...", kdf_params.m_cost / 1024, kdf_params.t_cost);
+    let mut key = derive_key(password, &salt, kdf_params)?;
     let cipher = build_cipher(cipher_type, &key)?;
     zeroize_key(&mut key);
 
@@ -248,7 +249,7 @@ pub fn encrypt(
         .len();
     let num_chunks = Header::num_chunks(input_len, chunk_size);
 
-    encrypt_with_cipher(input_path, output_path, &cipher, cipher_type, chunk_size, salt, base_nonce)?;
+    encrypt_with_cipher(input_path, output_path, &cipher, cipher_type, chunk_size, salt, base_nonce, kdf_params)?;
 
     eprintln!(
         "Encrypted {} → {} ({} chunks, {})",
@@ -272,6 +273,7 @@ pub fn encrypt_with_cipher(
     chunk_size: u32,
     salt: [u8; SALT_LEN],
     base_nonce: [u8; NONCE_LEN],
+    kdf_params: &KdfParams,
 ) -> Result<()> {
     if chunk_size == 0 {
         bail!("chunk size must be > 0");
@@ -298,9 +300,10 @@ pub fn encrypt_with_cipher(
         .open(output_path)
         .with_context(|| format!("cannot create output: {}", output_path.display()))?;
     output_file.set_len(output_size)?;
-    // Write the 4 KiB aligned header (52 bytes data + zero padding).
+    // Write the 4 KiB aligned header (52 bytes data + KDF params + zero padding).
     let mut aligned_hdr = AlignedBuf::new(ALIGNED_HEADER_SIZE);
     aligned_hdr[..HEADER_SIZE].copy_from_slice(&header_bytes);
+    kdf_params.write_to_aligned(&mut aligned_hdr);
     pwrite_aligned(output_file.as_raw_fd(), &aligned_hdr, 0)?;
 
     let input_fd = types::Fd(input_file.as_raw_fd());
@@ -438,6 +441,7 @@ pub fn decrypt(
     let mut header_bytes = [0u8; HEADER_SIZE];
     header_bytes.copy_from_slice(&aligned_hdr[..HEADER_SIZE]);
     let header = Header::deserialize(&header_bytes)?;
+    let kdf_params = KdfParams::read_from_aligned(&aligned_hdr);
 
     let expected = Header::output_size(header.original_size, header.chunk_size);
     if input_len != expected {
@@ -447,8 +451,8 @@ pub fn decrypt(
         );
     }
 
-    eprintln!("Deriving key with Argon2id (this may take a moment)...");
-    let mut key = derive_key(password, &header.salt)?;
+    eprintln!("Deriving key with Argon2id ({} MiB, {} iterations)...", kdf_params.m_cost / 1024, kdf_params.t_cost);
+    let mut key = derive_key(password, &header.salt, &kdf_params)?;
     let cipher = build_cipher(header.cipher, &key)?;
     zeroize_key(&mut key);
 

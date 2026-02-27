@@ -17,7 +17,7 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Encrypt { input, output, cipher, chunk_size } => {
+        Command::Encrypt { input, output, cipher, chunk_size, memory } => {
             let output = output.unwrap_or_else(|| {
                 let mut p = input.as_os_str().to_owned();
                 p.push(".enc");
@@ -35,7 +35,12 @@ fn run() -> Result<()> {
             }
 
             let mut password = read_password_twice()?;
-            let result = engine::encrypt(&input, &output, password.as_bytes(), cipher_type, Some(chunk_bytes));
+            let kdf_params = header::KdfParams {
+                m_cost: memory.saturating_mul(1024),
+                t_cost: 3,
+                p_cost: 4,
+            };
+            let result = engine::encrypt(&input, &output, password.as_bytes(), cipher_type, Some(chunk_bytes), &kdf_params);
             password.zeroize();
             result?;
         }

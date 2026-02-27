@@ -40,6 +40,10 @@ pub enum Command {
         /// Chunk size in MiB
         #[arg(long, default_value = "4")]
         chunk_size: u32,
+
+        /// Argon2id memory cost in MiB (higher = more resistant to brute-force)
+        #[arg(long, default_value = "256")]
+        memory: u32,
     },
 
     /// Decrypt a file

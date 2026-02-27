@@ -3,7 +3,7 @@ use std::path::Path;
 
 use concryptor::crypto::derive_key;
 use concryptor::engine::{self, build_cipher, Cipher};
-use concryptor::header::{CipherType, NONCE_LEN, SALT_LEN};
+use concryptor::header::{CipherType, KdfParams, NONCE_LEN, SALT_LEN};
 use criterion::{
     black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
 };
@@ -12,6 +12,13 @@ use rand::RngCore;
 const PASSWORD: &[u8] = b"benchmark-password-concryptor";
 const SALT: [u8; SALT_LEN] = [0xAA; SALT_LEN];
 const BASE_NONCE: [u8; NONCE_LEN] = [0xBB; NONCE_LEN];
+
+/// Low-cost KDF for benchmarks (only used for pre-derivation, not measured).
+const BENCH_KDF: KdfParams = KdfParams {
+    m_cost: 65_536,
+    t_cost: 3,
+    p_cost: 4,
+};
 
 fn write_random_file(path: &Path, size: usize) {
     let mut rng = rand::thread_rng();
@@ -22,7 +29,7 @@ fn write_random_file(path: &Path, size: usize) {
 
 /// Pre-derive the key once so benchmarks only measure IO + crypto.
 fn pre_derive_cipher(cipher_type: CipherType) -> Cipher {
-    let key = derive_key(PASSWORD, &SALT).unwrap();
+    let key = derive_key(PASSWORD, &SALT, &BENCH_KDF).unwrap();
     build_cipher(cipher_type, &key).unwrap()
 }
 
@@ -61,7 +68,7 @@ fn bench_encrypt_throughput(c: &mut Criterion) {
             // Warmup: one encrypt so OS caches the file
             let warmup = dir.path().join("warmup.enc");
             engine::encrypt_with_cipher(
-                &input, &warmup, &cipher, cipher_type, chunk_size, SALT, BASE_NONCE,
+                &input, &warmup, &cipher, cipher_type, chunk_size, SALT, BASE_NONCE, &BENCH_KDF,
             )
             .unwrap();
 
@@ -76,6 +83,7 @@ fn bench_encrypt_throughput(c: &mut Criterion) {
                         chunk_size,
                         SALT,
                         BASE_NONCE,
+                        &BENCH_KDF,
                     )
                     .unwrap();
                 });
@@ -118,7 +126,7 @@ fn bench_decrypt_throughput(c: &mut Criterion) {
             write_random_file(&input, size as usize);
             let enc = dir.path().join("encrypted.enc");
             engine::encrypt_with_cipher(
-                &input, &enc, &cipher, cipher_type, chunk_size, SALT, BASE_NONCE,
+                &input, &enc, &cipher, cipher_type, chunk_size, SALT, BASE_NONCE, &BENCH_KDF,
             )
             .unwrap();
 
@@ -171,6 +179,7 @@ fn bench_chunk_size_sweep(c: &mut Criterion) {
                     cs,
                     SALT,
                     BASE_NONCE,
+                    &BENCH_KDF,
                 )
                 .unwrap();
             });
@@ -215,6 +224,7 @@ fn bench_roundtrip(c: &mut Criterion) {
                     chunk_size,
                     SALT,
                     BASE_NONCE,
+                    &BENCH_KDF,
                 )
                 .unwrap();
                 engine::decrypt_with_cipher(black_box(&enc), &dec, &cipher).unwrap();

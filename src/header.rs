@@ -9,6 +9,57 @@ pub const HEADER_SIZE: usize = MAGIC.len() + 1 + 1 + 4 + 8 + SALT_LEN + NONCE_LE
 pub const SECTOR_SIZE: usize = 4096;
 pub const ALIGNED_HEADER_SIZE: usize = SECTOR_SIZE;
 
+/// Offset within the aligned header where KDF parameters are stored (after the 52-byte core).
+const KDF_PARAMS_OFFSET: usize = HEADER_SIZE;
+
+/// KDF parameters stored in the aligned header's reserved space.
+/// Self-authenticating: wrong params produce a wrong key, failing AEAD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KdfParams {
+    pub m_cost: u32, // memory in KiB
+    pub t_cost: u32, // iterations
+    pub p_cost: u32, // parallelism
+}
+
+impl KdfParams {
+    pub const DEFAULT: Self = Self {
+        m_cost: 256 * 1024, // 256 MiB
+        t_cost: 3,
+        p_cost: 4,
+    };
+
+    /// Legacy params for files that predate self-describing KDF (all-zero sentinel).
+    const LEGACY: Self = Self {
+        m_cost: 65_536, // 64 MiB
+        t_cost: 3,
+        p_cost: 4,
+    };
+
+    /// Write KDF parameters into the aligned header buffer at offset 52.
+    pub fn write_to_aligned(&self, buf: &mut [u8]) {
+        debug_assert!(buf.len() >= KDF_PARAMS_OFFSET + 12);
+        buf[KDF_PARAMS_OFFSET..KDF_PARAMS_OFFSET + 4].copy_from_slice(&self.m_cost.to_le_bytes());
+        buf[KDF_PARAMS_OFFSET + 4..KDF_PARAMS_OFFSET + 8].copy_from_slice(&self.t_cost.to_le_bytes());
+        buf[KDF_PARAMS_OFFSET + 8..KDF_PARAMS_OFFSET + 12].copy_from_slice(&self.p_cost.to_le_bytes());
+    }
+
+    /// Read KDF parameters from an aligned header buffer.
+    /// Returns legacy defaults if the fields are all zero (pre-V3.1 files).
+    pub fn read_from_aligned(buf: &[u8]) -> Self {
+        if buf.len() < KDF_PARAMS_OFFSET + 12 {
+            return Self::LEGACY;
+        }
+        let m = u32::from_le_bytes(buf[KDF_PARAMS_OFFSET..KDF_PARAMS_OFFSET + 4].try_into().unwrap());
+        let t = u32::from_le_bytes(buf[KDF_PARAMS_OFFSET + 4..KDF_PARAMS_OFFSET + 8].try_into().unwrap());
+        let p = u32::from_le_bytes(buf[KDF_PARAMS_OFFSET + 8..KDF_PARAMS_OFFSET + 12].try_into().unwrap());
+        if m == 0 && t == 0 && p == 0 {
+            Self::LEGACY
+        } else {
+            Self { m_cost: m, t_cost: t, p_cost: p }
+        }
+    }
+}
+
 /// Disk size of each encrypted chunk slot, padded to the next SECTOR_SIZE boundary.
 /// Every chunk occupies the same slot size for uniform offset arithmetic and O_DIRECT alignment.
 pub fn aligned_chunk_disk_size(chunk_size: u32) -> u64 {

@@ -4,8 +4,8 @@ use std::path::Path;
 use concryptor::crypto::{derive_key, derive_nonce};
 use concryptor::engine;
 use concryptor::header::{
-    aligned_chunk_disk_size, CipherType, Header, ALIGNED_HEADER_SIZE, HEADER_SIZE, NONCE_LEN,
-    SALT_LEN,
+    aligned_chunk_disk_size, CipherType, Header, KdfParams, ALIGNED_HEADER_SIZE, HEADER_SIZE,
+    NONCE_LEN, SALT_LEN,
 };
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -13,6 +13,13 @@ use tempfile::TempDir;
 
 const PASSWORD: &[u8] = b"test-password-for-concryptor";
 const CHUNK_1MB: u32 = 1024 * 1024;
+
+/// Low-cost KDF params so tests finish quickly.
+const TEST_KDF: KdfParams = KdfParams {
+    m_cost: 65_536, // 64 MiB
+    t_cost: 3,
+    p_cost: 4,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -48,7 +55,7 @@ fn roundtrip(
     cipher: CipherType,
     chunk_size: u32,
 ) {
-    engine::encrypt(input_path, enc_path, PASSWORD, cipher, Some(chunk_size))
+    engine::encrypt(input_path, enc_path, PASSWORD, cipher, Some(chunk_size), &TEST_KDF)
         .expect("encrypt failed");
     engine::decrypt(enc_path, dec_path, PASSWORD)
         .expect("decrypt failed");
@@ -123,22 +130,22 @@ fn header_num_chunks_with_remainder() {
 
 #[test]
 fn derive_key_deterministic() {
-    let k1 = derive_key(b"password", &[1u8; 16]).unwrap();
-    let k2 = derive_key(b"password", &[1u8; 16]).unwrap();
+    let k1 = derive_key(b"password", &[1u8; 16], &TEST_KDF).unwrap();
+    let k2 = derive_key(b"password", &[1u8; 16], &TEST_KDF).unwrap();
     assert_eq!(k1, k2);
 }
 
 #[test]
 fn derive_key_different_salt_yields_different_key() {
-    let k1 = derive_key(b"password", &[1u8; 16]).unwrap();
-    let k2 = derive_key(b"password", &[2u8; 16]).unwrap();
+    let k1 = derive_key(b"password", &[1u8; 16], &TEST_KDF).unwrap();
+    let k2 = derive_key(b"password", &[2u8; 16], &TEST_KDF).unwrap();
     assert_ne!(k1, k2);
 }
 
 #[test]
 fn derive_key_different_password_yields_different_key() {
-    let k1 = derive_key(b"alpha", &[0u8; 16]).unwrap();
-    let k2 = derive_key(b"bravo", &[0u8; 16]).unwrap();
+    let k1 = derive_key(b"alpha", &[0u8; 16], &TEST_KDF).unwrap();
+    let k2 = derive_key(b"bravo", &[0u8; 16], &TEST_KDF).unwrap();
     assert_ne!(k1, k2);
 }
 
@@ -293,7 +300,7 @@ fn wrong_password_fails_aes() {
     let enc = dir.path().join("secret.enc");
     let dec = dir.path().join("secret.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
         .expect("encrypt failed");
 
     let result = engine::decrypt(&enc, &dec, b"wrong-password");
@@ -308,7 +315,7 @@ fn wrong_password_fails_chacha() {
     let enc = dir.path().join("secret.enc");
     let dec = dir.path().join("secret.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::ChaCha20Poly1305, Some(CHUNK_1MB))
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::ChaCha20Poly1305, Some(CHUNK_1MB), &TEST_KDF)
         .expect("encrypt failed");
 
     let result = engine::decrypt(&enc, &dec, b"wrong-password");
@@ -327,7 +334,7 @@ fn tampered_ciphertext_detected() {
     let enc = dir.path().join("secret.enc");
     let dec = dir.path().join("secret.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
         .expect("encrypt failed");
 
     // Flip a byte in the middle of the ciphertext body (inside chunk 0)
@@ -348,7 +355,7 @@ fn tampered_tag_detected() {
     let enc = dir.path().join("secret.enc");
     let dec = dir.path().join("secret.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
         .expect("encrypt failed");
 
     // Corrupt a byte inside the tag of the only chunk
@@ -369,7 +376,7 @@ fn tampered_header_salt_detected() {
     let enc = dir.path().join("secret.enc");
     let dec = dir.path().join("secret.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
         .expect("encrypt failed");
 
     // Flip a byte in the salt region of the header
@@ -390,7 +397,7 @@ fn truncated_file_detected() {
     let enc = dir.path().join("secret.enc");
     let dec = dir.path().join("secret.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
         .expect("encrypt failed");
 
     // Truncate the encrypted file
@@ -414,7 +421,7 @@ fn chunk_swap_attack_detected() {
     let enc = dir.path().join("secret.enc");
     let dec = dir.path().join("secret.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
         .expect("encrypt failed");
 
     let mut data = fs::read(&enc).unwrap();
@@ -444,7 +451,7 @@ fn encrypted_file_has_correct_size() {
     write_random_file(&input, size);
     let enc = dir.path().join("sized.enc");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
         .expect("encrypt failed");
 
     let expected = Header::output_size(size as u64, CHUNK_1MB);
@@ -459,7 +466,7 @@ fn encrypted_file_header_readable() {
     write_random_file(&input, 1000);
     let enc = dir.path().join("readable.enc");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::ChaCha20Poly1305, Some(CHUNK_1MB))
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::ChaCha20Poly1305, Some(CHUNK_1MB), &TEST_KDF)
         .expect("encrypt failed");
 
     let data = fs::read(&enc).unwrap();
@@ -481,8 +488,8 @@ fn encryption_is_non_deterministic() {
     let enc1 = dir.path().join("ndet1.enc");
     let enc2 = dir.path().join("ndet2.enc");
 
-    engine::encrypt(&input, &enc1, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB)).unwrap();
-    engine::encrypt(&input, &enc2, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB)).unwrap();
+    engine::encrypt(&input, &enc1, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF).unwrap();
+    engine::encrypt(&input, &enc2, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF).unwrap();
 
     let d1 = fs::read(&enc1).unwrap();
     let d2 = fs::read(&enc2).unwrap();
@@ -502,7 +509,7 @@ fn cipher_type_mismatch_fails() {
     let enc = dir.path().join("cross.enc");
     let dec = dir.path().join("cross.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB)).unwrap();
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF).unwrap();
 
     // Overwrite the cipher byte in the header to claim it's ChaCha20
     let mut data = fs::read(&enc).unwrap();
@@ -541,7 +548,7 @@ fn truncation_attack_modify_original_size_detected() {
     let enc = dir.path().join("trunc.enc");
     let dec = dir.path().join("trunc.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
         .expect("encrypt failed");
 
     // Attacker modifies original_size in the header to claim only 2 chunks,
@@ -570,7 +577,7 @@ fn truncation_attack_remove_last_chunk_detected() {
     let enc = dir.path().join("trunc2.enc");
     let dec = dir.path().join("trunc2.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
         .expect("encrypt failed");
 
     // Attacker removes the last chunk and adjusts header to 1 chunk.
@@ -601,7 +608,7 @@ fn modified_chunk_size_in_header_detected() {
     let enc = dir.path().join("hdr.enc");
     let dec = dir.path().join("hdr.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
         .expect("encrypt failed");
 
     // Change the chunk_size field in the header (offset 12..16)
@@ -627,7 +634,7 @@ fn tampered_padding_detected() {
     let enc = dir.path().join("pad.enc");
     let dec = dir.path().join("pad.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
         .expect("encrypt failed");
 
     // Write non-zero bytes into the padding region after the tag.
@@ -655,7 +662,7 @@ fn failed_decrypt_removes_output() {
     let enc = dir.path().join("cleanup.enc");
     let dec = dir.path().join("cleanup.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB))
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
         .expect("encrypt failed");
 
     let result = engine::decrypt(&enc, &dec, b"wrong-password");

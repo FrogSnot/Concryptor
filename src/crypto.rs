@@ -2,16 +2,13 @@ use anyhow::Result;
 use argon2::{Algorithm, Argon2, Params, Version};
 use zeroize::Zeroize;
 
-use crate::header::NONCE_LEN;
+use crate::header::{KdfParams, NONCE_LEN};
 
 const KEY_LEN: usize = 32;
-const ARGON2_MEM_COST: u32 = 65_536; // 64 MiB
-const ARGON2_TIME_COST: u32 = 3;
-const ARGON2_PARALLELISM: u32 = 4;
 
 /// Derives a 256-bit key from a password and salt using Argon2id.
-pub fn derive_key(password: &[u8], salt: &[u8]) -> Result<[u8; KEY_LEN]> {
-    let params = Params::new(ARGON2_MEM_COST, ARGON2_TIME_COST, ARGON2_PARALLELISM, Some(KEY_LEN))
+pub fn derive_key(password: &[u8], salt: &[u8], kdf: &KdfParams) -> Result<[u8; KEY_LEN]> {
+    let params = Params::new(kdf.m_cost, kdf.t_cost, kdf.p_cost, Some(KEY_LEN))
         .map_err(|e| anyhow::anyhow!("argon2 params error: {e}"))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 

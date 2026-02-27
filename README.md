@@ -7,7 +7,8 @@ A multi-threaded AEAD encryption engine built in Rust. Encrypts and decrypts fil
 - **Dual cipher support**: AES-256-GCM (hardware AES-NI) and ChaCha20-Poly1305 via `ring` (assembly-optimized)
 - **Parallel encryption**: Rayon-based multi-threaded chunk processing across all CPU cores
 - **Triple-buffered io_uring pipeline**: Overlaps kernel I/O and CPU-side crypto using three rotating buffer pools — while one batch's writes are in-flight, the next batch is being encrypted by Rayon, and the third batch's reads are in-flight. No syscall-per-chunk overhead, no mmap limitations (no SIGBUS, no virtual address space exhaustion)
-- **Argon2id key derivation**: Industry-standard password-to-key stretching (64 MiB memory, 3 iterations)
+- **Argon2id key derivation**: Industry-standard password-to-key stretching (default 256 MiB memory, 3 iterations, configurable via `--memory`)
+- **Self-describing KDF parameters**: Memory cost, iterations, and parallelism are stored in the encrypted file header so decryption uses exactly the parameters that were chosen at encryption time. Legacy files (all-zero sentinel) are handled transparently with the old 64 MiB defaults
 - **Chunk-indexed nonces**: TLS 1.3-style XOR nonce derivation prevents chunk reordering attacks
 - **Header-authenticated AAD**: The full serialized header is included in every chunk's AAD, preventing truncation and header-field manipulation attacks
 - **STREAM-style final chunk**: A final-chunk flag in the AAD prevents truncation and append attacks (inspired by the STREAM construction)
@@ -15,7 +16,7 @@ A multi-threaded AEAD encryption engine built in Rust. Encrypts and decrypts fil
 - **In-place encryption**: `seal_in_place_separate_tag` / `open_in_place` via `ring` minimizes allocation in the hot loop
 - **Password zeroization**: Keys and passwords are securely wiped from memory after use
 - **O_DIRECT + sector-aligned format (v3)**: 4 KiB-aligned header and chunk slots enable `O_DIRECT` I/O, bypassing the kernel page cache for DMA-speed reads/writes on NVMe. Buffer pools use `std::alloc` with 4096-byte alignment
-- **Self-describing file format (v3)**: Header stores cipher, chunk size, original file size, salt, and base nonce
+- **Self-describing file format (v3)**: Header stores cipher, chunk size, original file size, salt, base nonce, and Argon2id KDF parameters
 
 ## Performance
 
@@ -90,6 +91,9 @@ concryptor encrypt myfile.dat --cipher chacha -o encrypted.enc
 
 # Custom chunk size (in MiB)
 concryptor encrypt largefile.iso --chunk-size 8
+
+# Stronger KDF (512 MiB memory cost)
+concryptor encrypt secrets.tar --memory 512
 ```
 
 ### Decrypt
@@ -124,13 +128,16 @@ Offset  Size   Field
 16       8     Original file size (bytes, LE)
 24      16     Argon2 salt (cryptographically random, unique per file)
 40      12     Base nonce (cryptographically random, unique per file)
-52    4044     Reserved (zero-padded to 4096 bytes)
+52       4     Argon2 m_cost in KiB (LE, 0 = legacy 64 MiB)
+56       4     Argon2 t_cost / iterations (LE, 0 = legacy 3)
+60       4     Argon2 p_cost / parallelism (LE, 0 = legacy 4)
+64    4032     Reserved (zero-padded to 4096 bytes)
 4096    ...    [Chunk 0: ciphertext + 16-byte tag + zero padding to sector boundary]
                [Chunk 1: ciphertext + 16-byte tag + zero padding to sector boundary]
                ...
 ```
 
-For 4 MiB chunks: each disk slot is `ceil((4194304 + 16) / 4096) * 4096 = 4198400` bytes (4080 bytes of padding per chunk). The 4044 reserved bytes in the header are available for future features (asymmetric key slots, metadata, etc.).
+For 4 MiB chunks: each disk slot is `ceil((4194304 + 16) / 4096) * 4096 = 4198400` bytes (4080 bytes of padding per chunk). The 4032 reserved bytes in the header are available for future features (asymmetric key slots, metadata, etc.).
 
 The salt and base nonce are generated fresh from `rand::thread_rng()` (backed by the OS CSPRNG) on every encryption. Reusing a password across files is safe because different salts produce different Argon2id keys, and different base nonces produce different per-chunk nonces.
 
@@ -142,13 +149,13 @@ The salt and base nonce are generated fresh from `rand::thread_rng()` (backed by
   - **Truncation**: Removing the final chunk and promoting a non-final chunk to the end fails because the non-final chunk was encrypted with `is_final = 0x00` but decryption expects `0x01`.
   - **Extension**: Appending forged chunks fails because the attacker cannot produce a valid tag for `is_final = 0x01` without the key.
 - **Fresh randomness per file**: A 16-byte salt and 12-byte base nonce are drawn from the OS CSPRNG (`rand::thread_rng()`) for every encryption. Two encryptions of the same file with the same password produce completely different ciphertext. Nonce reuse (which is catastrophic for AES-GCM) is avoided by construction.
-- **Key derivation**: Argon2id with 64 MiB memory cost, 3 time iterations, parallelism of 4. Resistant to GPU/ASIC brute-force attacks.
+- **Key derivation**: Argon2id with configurable memory cost (default 256 MiB, tunable via `--memory`), 3 time iterations, parallelism of 4. The 256 MiB default is 4× the OWASP minimum and expensive for GPU/FPGA/ASIC attackers. KDF parameters are stored in the file header (bytes 52-63), making files self-describing — decryption always uses the correct parameters regardless of current defaults. If bytes 52-63 are all zero (legacy pre-KDF-params files), the old 64 MiB / 3 / 4 defaults are applied.
 - **Zeroization**: Encryption keys are zeroized immediately after cipher construction. Passwords are zeroized after use.
 
 ## Testing
 
 ```bash
-# Run the full test suite (38 tests)
+# Run the full test suite (40 tests)
 cargo test
 
 # Run benchmarks (HTML reports in target/criterion/)
