@@ -15,8 +15,8 @@ A multi-threaded AEAD encryption engine built in Rust. Encrypts and decrypts fil
 - **Fresh randomness per file**: Cryptographically random 16-byte salt and 12-byte base nonce are generated for every encryption, stored in the header
 - **In-place encryption**: `seal_in_place_separate_tag` / `open_in_place` via `ring` minimizes allocation in the hot loop
 - **Password zeroization**: Keys and passwords are securely wiped from memory after use
-- **O_DIRECT + sector-aligned format (v3)**: 4 KiB-aligned header and chunk slots enable `O_DIRECT` I/O, bypassing the kernel page cache for DMA-speed reads/writes on NVMe. Buffer pools use `std::alloc` with 4096-byte alignment
-- **Self-describing file format (v3)**: Header stores cipher, chunk size, original file size, salt, base nonce, and Argon2id KDF parameters
+- **O_DIRECT + sector-aligned format**: 4 KiB-aligned header and chunk slots enable `O_DIRECT` I/O, bypassing the kernel page cache for DMA-speed reads/writes on NVMe. Buffer pools use `std::alloc` with 4096-byte alignment
+- **Self-describing file format**: Header stores cipher, chunk size, original file size, salt, base nonce, and Argon2id KDF parameters
 
 ## Performance
 
