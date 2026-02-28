@@ -114,7 +114,7 @@ concryptor encrypt --help
 concryptor decrypt --help
 ```
 
-## File Format (v3: Aligned)
+## File Format
 
 All values are little-endian. The header occupies a full 4 KiB sector; each encrypted chunk slot is padded to the next 4 KiB boundary. This ensures every offset and I/O size is sector-aligned for `O_DIRECT`.
 
