@@ -2,6 +2,10 @@
 
 A multi-threaded AEAD encryption engine built in Rust. Encrypts and decrypts files at gigabyte-per-second throughput using a triple-buffered `io_uring` pipeline, parallel chunk processing via Rayon, and assembly-optimized ciphers via `ring`.
 
+⚠️ **DISCLAIMER: EXPERIMENTAL SOFTWARE** ⚠️
+
+**This project is extremely new and currently NOT recommended for production or mission-critical use.** While the cryptographic primitives (AES-256-GCM, ChaCha20-Poly1305 via `ring`) and format design are sound, the codebase has not undergone formal security audits or extensive real-world testing. Use at your own risk. For protecting sensitive data, consider using battle-tested tools like GnuPG, age, or OpenSSL until this project matures.
+
 ## Features
 
 - **Dual cipher support**: AES-256-GCM (hardware AES-NI) and ChaCha20-Poly1305 via `ring` (assembly-optimized)
