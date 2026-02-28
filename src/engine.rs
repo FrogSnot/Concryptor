@@ -102,11 +102,27 @@ fn compute_batch_cap(num_chunks: usize, chunk_size: u64) -> usize {
 }
 
 /// Drain CQEs, routing completions to per-slot counters via user_data tags.
-/// Each SQE is tagged as `(TAG_READ|TAG_WRITE) | slot_index`.
-/// Waits until `pending[target_slot]` reaches zero.
-const TAG_READ: u64 = 0;
-const TAG_WRITE: u64 = 1 << 32;
-const TAG_MASK: u64 = 1 << 32;
+/// Each SQE's user_data is packed as: bits[1:0]=slot, bit[2]=read/write tag,
+/// bits[63:3]=expected byte count. This lets us detect short reads/writes.
+const SLOT_MASK: u64 = 0b11;
+const TAG_BIT: u64 = 1 << 2;
+const SIZE_SHIFT: u32 = 3;
+
+/// Pack slot index, read/write tag, and expected byte count into user_data.
+#[inline]
+fn pack_user_data(slot: usize, is_write: bool, expected_bytes: u32) -> u64 {
+    (slot as u64 & SLOT_MASK)
+        | if is_write { TAG_BIT } else { 0 }
+        | ((expected_bytes as u64) << SIZE_SHIFT)
+}
+
+/// Unpack slot index and expected byte count from user_data.
+#[inline]
+fn unpack_user_data(ud: u64) -> (usize, u32) {
+    let slot = (ud & SLOT_MASK) as usize;
+    let expected = (ud >> SIZE_SHIFT) as u32;
+    (slot, expected)
+}
 
 fn drain_slot(
     ring: &mut IoUring,
@@ -116,13 +132,20 @@ fn drain_slot(
     while pending[target_slot] > 0 {
         ring.submit_and_wait(1)?;
         for cqe in ring.completion() {
-            if cqe.result() < 0 {
+            let result = cqe.result();
+            if result < 0 {
                 bail!(
                     "io_uring I/O error: {}",
-                    std::io::Error::from_raw_os_error(-cqe.result())
+                    std::io::Error::from_raw_os_error(-result)
                 );
             }
-            let slot = (cqe.user_data() & !TAG_MASK) as usize;
+            let (slot, expected) = unpack_user_data(cqe.user_data());
+            if (result as u32) != expected {
+                bail!(
+                    "io_uring short I/O: expected {expected} bytes, got {result} \
+                     (possible hardware error or unsupported filesystem)"
+                );
+            }
             if slot < PIPELINE_DEPTH {
                 pending[slot] = pending[slot].saturating_sub(1);
             }
@@ -358,7 +381,7 @@ pub fn encrypt_with_cipher(
                         )
                         .offset(i as u64 * cs)
                         .build()
-                        .user_data(TAG_READ | read_slot as u64);
+                        .user_data(pack_user_data(read_slot, false, pt_len as u32));
                         unsafe { sq.push(&sqe).expect("SQ full"); }
                         pending[read_slot] += 1;
                     }
@@ -405,7 +428,7 @@ pub fn encrypt_with_cipher(
                     )
                     .offset(out_off)
                     .build()
-                    .user_data(TAG_WRITE | crypto_slot as u64);
+                    .user_data(pack_user_data(crypto_slot, true, disk_chunk as u32));
                     unsafe { sq.push(&sqe).expect("SQ full"); }
                     pending[crypto_slot] += 1;
                 }
@@ -592,7 +615,7 @@ fn decrypt_pipeline(
                     )
                     .offset(in_off)
                     .build()
-                    .user_data(TAG_READ | read_slot as u64);
+                    .user_data(pack_user_data(read_slot, false, disk_chunk as u32));
                     unsafe { sq.push(&sqe).expect("SQ full"); }
                     pending[read_slot] += 1;
                 }
@@ -639,7 +662,7 @@ fn decrypt_pipeline(
                         )
                         .offset(out_off)
                         .build()
-                        .user_data(TAG_WRITE | crypto_slot as u64);
+                        .user_data(pack_user_data(crypto_slot, true, pt_len as u32));
                         unsafe { sq.push(&sqe).expect("SQ full"); }
                         pending[crypto_slot] += 1;
                     }
