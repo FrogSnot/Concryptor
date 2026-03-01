@@ -1,5 +1,7 @@
 # Concryptor
 
+[![Crates.io](https://img.shields.io/crates/v/concryptor.svg)](https://crates.io/crates/concryptor)
+
 A multi-threaded AEAD encryption engine built in Rust. Encrypts and decrypts files at gigabyte-per-second throughput using a triple-buffered `io_uring` pipeline, parallel chunk processing via Rayon, and assembly-optimized ciphers via `ring`.
 
 ⚠️ **DISCLAIMER: EXPERIMENTAL SOFTWARE** ⚠️
