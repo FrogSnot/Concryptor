@@ -1,9 +1,10 @@
 [package]
 name = "concryptor"
-version = "0.1.0"
+version = "1.0.1"
 edition = "2021"
 description = "A multi-threaded AEAD encryption engine"
 license = "AGPL-3.0-or-later"
+repository = "https://github.com/FrogSnot/Concryptor"
 
 [dependencies]
 ring = "0.17"
