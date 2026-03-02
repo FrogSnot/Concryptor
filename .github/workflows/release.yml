@@ -28,6 +28,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Bump Cargo.toml version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "0,/^version = .*/s//version = \"${VERSION}\"/" Cargo.toml
+          echo "Publishing version ${VERSION}"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -89,3 +95,23 @@ jobs:
             release/concryptor-linux-aarch64
             release/concryptor-linux-aarch64.sha256
             release/concryptor-linux-aarch64.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bump Cargo.toml version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "0,/^version = .*/s//version = \"${VERSION}\"/" Cargo.toml
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_API }}
+        run: cargo publish --no-verify
