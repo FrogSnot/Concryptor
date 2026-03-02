@@ -17,7 +17,7 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Encrypt { input, output, cipher, chunk_size, memory } => {
+        Command::Encrypt { input, output, cipher, chunk_size, memory, password } => {
             let output = output.unwrap_or_else(|| {
                 let mut p = input.as_os_str().to_owned();
                 p.push(".enc");
@@ -34,7 +34,15 @@ fn run() -> Result<()> {
                 anyhow::bail!("chunk size must be at least 1 MiB");
             }
 
-            let mut password = read_password_twice()?;
+            let mut password = match password {
+                Some(p) => {
+                    if p.is_empty() {
+                        anyhow::bail!("password cannot be empty");
+                    }
+                    p
+                }
+                None => read_password_twice()?,
+            };
             let kdf_params = header::KdfParams {
                 m_cost: memory.saturating_mul(1024),
                 t_cost: 3,
@@ -45,7 +53,7 @@ fn run() -> Result<()> {
             result?;
         }
 
-        Command::Decrypt { input, output } => {
+        Command::Decrypt { input, output, password } => {
             let output = output.unwrap_or_else(|| {
                 let name = input.to_string_lossy();
                 if let Some(stripped) = name.strip_suffix(".enc") {
@@ -57,8 +65,16 @@ fn run() -> Result<()> {
                 }
             });
 
-            let mut password = rpassword::prompt_password("Password: ")
-                .map_err(|e| anyhow::anyhow!("failed to read password: {e}"))?;
+            let mut password = match password {
+                Some(p) => {
+                    if p.is_empty() {
+                        anyhow::bail!("password cannot be empty");
+                    }
+                    p
+                }
+                None => rpassword::prompt_password("Password: ")
+                    .map_err(|e| anyhow::anyhow!("failed to read password: {e}"))?,
+            };
             let result = engine::decrypt(&input, &output, password.as_bytes());
             password.zeroize();
             result?;

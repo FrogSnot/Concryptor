@@ -44,6 +44,10 @@ pub enum Command {
         /// Argon2id memory cost in MiB (higher = more resistant to brute-force)
         #[arg(long, default_value = "256")]
         memory: u32,
+
+        /// Password (skips interactive prompt; visible in process listings and shell history)
+        #[arg(short, long)]
+        password: Option<String>,
     },
 
     /// Decrypt a file
@@ -55,5 +59,9 @@ pub enum Command {
         /// Output file (defaults to <input> with .enc stripped, or <input>.dec)
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Password (skips interactive prompt; visible in process listings and shell history)
+        #[arg(short, long)]
+        password: Option<String>,
     },
 }

@@ -100,7 +100,12 @@ concryptor encrypt largefile.iso --chunk-size 8
 
 # Stronger KDF (512 MiB memory cost)
 concryptor encrypt secrets.tar --memory 512
+
+# Non-interactive (skips password prompt)
+concryptor encrypt myfile.dat -p "password"
 ```
+
+> **Security note:** `--password` / `-p` passes the password as a CLI argument, which is visible in `ps` output and shell history. For interactive use, omit it to get the secure hidden prompt. For scripting, prefer clearing history afterward or using a wrapper that reads from a file descriptor.
 
 ### Decrypt
 
@@ -110,6 +115,9 @@ concryptor decrypt myfile.dat.enc
 
 # Custom output path
 concryptor decrypt encrypted.enc -o restored.dat
+
+# Non-interactive
+concryptor decrypt myfile.dat.enc -p "password"
 ```
 
 ### Help
