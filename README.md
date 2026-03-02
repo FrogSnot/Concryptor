@@ -77,7 +77,7 @@ Buffer pools are allocated once via `std::alloc::alloc_zeroed` with `Layout::fro
 ## Installation
 
 ```bash
-git clone https://github.com/youruser/concryptor.git
+git clone https://github.com/frogsnot/concryptor.git
 cd concryptor
 cargo build --release
 ```
