@@ -669,3 +669,56 @@ fn failed_decrypt_removes_output() {
     assert!(result.is_err());
     assert!(!dec.exists(), "output file must be removed after failed decryption");
 }
+
+// ===========================================================================
+// Security: reserved header bytes tampering (full-header AAD, v4+)
+// ===========================================================================
+
+#[test]
+fn tampered_reserved_header_bytes_detected() {
+    let dir = tmp();
+    let input = dir.path().join("res.bin");
+    write_random_file(&input, CHUNK_1MB as usize);
+    let enc = dir.path().join("res.enc");
+    let dec = dir.path().join("res.dec");
+
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
+        .expect("encrypt failed");
+
+    // Modify reserved padding bytes (offset 64-4095) that were previously unauthenticated.
+    let mut data = fs::read(&enc).unwrap();
+    data[100] = 0xFF;
+    data[2048] = 0xDE;
+    data[4000] = 0xAD;
+    fs::write(&enc, &data).unwrap();
+
+    let result = engine::decrypt(&enc, &dec, PASSWORD);
+    assert!(
+        result.is_err(),
+        "tampering with reserved header bytes must be detected via full-header AAD"
+    );
+}
+
+#[test]
+fn tampered_kdf_params_in_header_detected() {
+    let dir = tmp();
+    let input = dir.path().join("kdf.bin");
+    write_random_file(&input, CHUNK_1MB as usize);
+    let enc = dir.path().join("kdf.enc");
+    let dec = dir.path().join("kdf.dec");
+
+    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
+        .expect("encrypt failed");
+
+    // Modify the KDF m_cost field (bytes 52-55) in the header.
+    let mut data = fs::read(&enc).unwrap();
+    let fake_m_cost: u32 = 32_768;
+    data[52..56].copy_from_slice(&fake_m_cost.to_le_bytes());
+    fs::write(&enc, &data).unwrap();
+
+    let result = engine::decrypt(&enc, &dec, PASSWORD);
+    assert!(
+        result.is_err(),
+        "tampering with KDF parameters must be detected (wrong key + AAD mismatch)"
+    );
+}

@@ -16,7 +16,7 @@ A multi-threaded AEAD encryption engine built in Rust. Encrypts and decrypts fil
 - **Argon2id key derivation**: Industry-standard password-to-key stretching (default 256 MiB memory, 3 iterations, configurable via `--memory`)
 - **Self-describing KDF parameters**: Memory cost, iterations, and parallelism are stored in the encrypted file header so decryption uses exactly the parameters that were chosen at encryption time. Legacy files (all-zero sentinel) are handled transparently with the old 64 MiB defaults
 - **Chunk-indexed nonces**: TLS 1.3-style XOR nonce derivation prevents chunk reordering attacks
-- **Header-authenticated AAD**: The full serialized header is included in every chunk's AAD, preventing truncation and header-field manipulation attacks
+- **Header-authenticated AAD**: The full 4 KiB aligned header is included in every chunk's AAD, authenticating all header fields (core, KDF parameters, and reserved bytes) and preventing truncation, header-field manipulation, and reserved-byte smuggling attacks
 - **STREAM-style final chunk**: A final-chunk flag in the AAD prevents truncation and append attacks (inspired by the STREAM construction)
 - **Fresh randomness per file**: Cryptographically random 16-byte salt and 12-byte base nonce are generated for every encryption, stored in the header
 - **In-place encryption**: `seal_in_place_separate_tag` / `open_in_place` via `ring` minimizes allocation in the hot loop
@@ -136,7 +136,7 @@ All values are little-endian. The header occupies a full 4 KiB sector; each encr
 Offset  Size   Field
 ------  -----  ---------------------
 0       10     Magic bytes "CONCRYPTOR"
-10       1     Format version (3)
+10       1     Format version (4)
 11       1     Cipher type (0 = AES-256-GCM, 1 = ChaCha20-Poly1305)
 12       4     Chunk size (bytes, LE)
 16       8     Original file size (bytes, LE)
@@ -158,7 +158,7 @@ The salt and base nonce are generated fresh from `rand::thread_rng()` (backed by
 ## Security Design
 
 - **Nonce derivation**: `chunk_nonce = base_nonce XOR chunk_index` (TLS 1.3 style). Swapping chunks causes decryption failure because the nonce at position N won't match the nonce used to encrypt the chunk originally at position M.
-- **Header-authenticated AAD**: Every chunk's AEAD call uses `AAD = header_bytes (52) || chunk_index (8 LE) || is_final (1)` (61 bytes total). The full serialized header is bound into every chunk's authentication tag. Modifying *any* header field (cipher type, chunk size, original size, salt, nonce) invalidates all chunks. This prevents truncation attacks where an adversary edits `original_size` and removes trailing chunks.
+- **Header-authenticated AAD**: Every chunk's AEAD call uses `AAD = full_aligned_header (4096) || chunk_index (8 LE) || is_final (1)` (4105 bytes total). The entire 4 KiB header sector (core fields, KDF parameters, and reserved padding) is bound into every chunk's authentication tag. Modifying *any* header byte (cipher type, chunk size, original size, salt, nonce, KDF parameters, or reserved padding) invalidates all chunks. This prevents truncation attacks where an adversary edits `original_size` and removes trailing chunks, and also prevents smuggling data into the reserved padding region. Legacy v3 files are decrypted with 52-byte AAD for backward compatibility; no downgrade from v4 to v3 is possible because the version byte itself is within the authenticated AAD.
 - **STREAM-style final chunk indicator**: The last byte of the AAD is `0x01` for the final chunk and `0x00` for all others. This prevents two attacks:
   - **Truncation**: Removing the final chunk and promoting a non-final chunk to the end fails because the non-final chunk was encrypted with `is_final = 0x00` but decryption expects `0x01`.
   - **Extension**: Appending forged chunks fails because the attacker cannot produce a valid tag for `is_final = 0x01` without the key.
@@ -191,6 +191,7 @@ The test suite covers:
 - Cipher type mismatch detection
 - **Truncation attack detection** (modified `original_size` + removed chunks)
 - **Header field manipulation detection** (modified `chunk_size`)
+- **Reserved header bytes tampering detection** (modified padding region)
 - Non-deterministic encryption verification
 - Stress test with 256 small chunks
 

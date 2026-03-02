@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 
 pub const MAGIC: &[u8; 10] = b"CONCRYPTOR";
-pub const VERSION: u8 = 3;
+pub const VERSION: u8 = 4;
 pub const TAG_SIZE: usize = 16; // AES-GCM and ChaCha20Poly1305 both use 16-byte tags
 pub const SALT_LEN: usize = 16;
 pub const NONCE_LEN: usize = 12;
@@ -89,6 +89,7 @@ impl CipherType {
 ///   [OrigSize: 8B LE][Salt: 16B][BaseNonce: 12B]
 #[derive(Debug, Clone)]
 pub struct Header {
+    pub version: u8,
     pub cipher: CipherType,
     pub chunk_size: u32,
     pub original_size: u64,
@@ -104,7 +105,7 @@ impl Header {
         salt: [u8; SALT_LEN],
         base_nonce: [u8; NONCE_LEN],
     ) -> Self {
-        Self { cipher, chunk_size, original_size, salt, base_nonce }
+        Self { version: VERSION, cipher, chunk_size, original_size, salt, base_nonce }
     }
 
     pub fn serialize(&self, buf: &mut [u8]) {
@@ -145,8 +146,8 @@ impl Header {
         pos += MAGIC.len();
 
         let version = buf[pos];
-        if version != VERSION {
-            bail!("unsupported file version: {version} (expected {VERSION})");
+        if version < 3 || version > VERSION {
+            bail!("unsupported file version: {version} (expected 3..{VERSION})");
         }
         pos += 1;
 
@@ -167,7 +168,7 @@ impl Header {
         let mut base_nonce = [0u8; NONCE_LEN];
         base_nonce.copy_from_slice(&buf[pos..pos + NONCE_LEN]);
 
-        Ok(Self { cipher, chunk_size, original_size, salt, base_nonce })
+        Ok(Self { version, cipher, chunk_size, original_size, salt, base_nonce })
     }
 
     /// Total output file size for encryption.

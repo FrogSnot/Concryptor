@@ -19,20 +19,16 @@ use crate::header::{
 
 pub const DEFAULT_CHUNK_SIZE: u32 = 4 * 1024 * 1024; // 4 MiB
 
-/// AAD size: 52-byte header + 8-byte chunk index + 1-byte final flag.
-const AAD_SIZE: usize = HEADER_SIZE + 9;
-
-/// Builds the per-chunk AAD: full serialized header || chunk_index (LE) || is_final.
+/// Builds the per-chunk AAD: header || chunk_index (8 LE) || is_final (1).
 ///
-/// This binds every chunk to the exact file header (cipher, chunk size, original
-/// size, salt, nonce) and marks the final chunk, implementing STREAM-style
-/// commit-or-abort semantics that prevent truncation and append attacks.
-fn build_aad(header_bytes: &[u8], chunk_index: u64, is_final: bool) -> [u8; AAD_SIZE] {
-    debug_assert_eq!(header_bytes.len(), HEADER_SIZE);
-    let mut aad = [0u8; AAD_SIZE];
-    aad[..HEADER_SIZE].copy_from_slice(header_bytes);
-    aad[HEADER_SIZE..HEADER_SIZE + 8].copy_from_slice(&chunk_index.to_le_bytes());
-    aad[HEADER_SIZE + 8] = u8::from(is_final);
+/// v4+: the full 4 KiB aligned header is included, authenticating core fields,
+/// KDF parameters, and reserved padding in every chunk's tag.
+/// v3 (legacy): only the 52-byte core header was included.
+fn build_aad(header_bytes: &[u8], chunk_index: u64, is_final: bool) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(header_bytes.len() + 9);
+    aad.extend_from_slice(header_bytes);
+    aad.extend_from_slice(&chunk_index.to_le_bytes());
+    aad.push(u8::from(is_final));
     aad
 }
 
@@ -408,7 +404,7 @@ pub fn encrypt_with_cipher(
                     let pt_len = chunk_pt_len(i, cs, input_len);
                     let nonce = derive_nonce(&base_nonce, i);
                     let is_final = i == last_chunk_idx;
-                    let aad = build_aad(&header_bytes, i, is_final);
+                    let aad = build_aad(&aligned_hdr[..], i, is_final);
                     let tag = cipher.encrypt_chunk(&nonce, &aad, &mut buf[..pt_len])?;
                     buf[pt_len..pt_len + TAG_SIZE].copy_from_slice(&tag);
                     // Zero padding for O_DIRECT sector alignment.
@@ -542,8 +538,16 @@ pub fn decrypt_with_cipher(
         .with_context(|| format!("cannot create output: {}", output_path.display()))?;
     output_file.set_len(header.original_size)?;
 
+    // v4: full 4 KiB header in AAD (authenticates all header bytes).
+    // v3: only the 52-byte core header (legacy).
+    let aad_header: &[u8] = if header.version >= 4 {
+        &aligned_hdr[..]
+    } else {
+        &header_bytes[..]
+    };
+
     let result = decrypt_pipeline(
-        &input_file, &output_file, cipher, &header_bytes, &header, num_chunks,
+        &input_file, &output_file, cipher, aad_header, &header, num_chunks,
         last_chunk_idx, cs, disk_chunk,
     );
 
@@ -559,7 +563,7 @@ fn decrypt_pipeline(
     input_file: &File,
     output_file: &File,
     cipher: &Cipher,
-    header_bytes: &[u8; HEADER_SIZE],
+    aad_header: &[u8],
     header: &Header,
     num_chunks: usize,
     last_chunk_idx: u64,
@@ -639,7 +643,7 @@ fn decrypt_pipeline(
                     let pt_len = chunk_pt_len(i, cs, header.original_size);
                     let nonce = derive_nonce(&header.base_nonce, i);
                     let is_final = i == last_chunk_idx;
-                    let aad = build_aad(header_bytes, i, is_final);
+                    let aad = build_aad(aad_header, i, is_final);
                     cipher.decrypt_chunk(&nonce, &aad, &mut buf[..pt_len + TAG_SIZE])?;
                     // Verify sector-alignment padding is untampered.
                     if buf[pt_len + TAG_SIZE..].iter().any(|&b| b != 0) {
