@@ -56,9 +56,13 @@ pub enum Command {
         /// Input file to decrypt
         input: PathBuf,
 
-        /// Output file (defaults to <input> with .enc stripped, or <input>.dec)
+        /// Output file or directory (defaults to <input> with .enc stripped, or <input>.dec)
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Extract directory archive after decryption
+        #[arg(short = 'x', long)]
+        extract: bool,
 
         /// Password (skips interactive prompt; visible in process listings and shell history)
         #[arg(short, long)]

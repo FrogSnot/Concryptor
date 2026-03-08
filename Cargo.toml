@@ -18,6 +18,7 @@ rand = "0.8"
 anyhow = "1"
 rpassword = "7"
 zeroize = { version = "1", features = ["derive"] }
+tar = "0.4"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 
+use concryptor::archive;
 use concryptor::crypto::{derive_key, derive_nonce};
 use concryptor::engine;
 use concryptor::header::{
@@ -721,4 +722,351 @@ fn tampered_kdf_params_in_header_detected() {
         result.is_err(),
         "tampering with KDF parameters must be detected (wrong key + AAD mismatch)"
     );
+}
+
+// ===========================================================================
+// Directory archive: pack / unpack roundtrip
+// ===========================================================================
+
+/// Create a test directory structure with known content.
+fn create_test_dir(base: &Path) {
+    let sub = base.join("subdir");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(base.join("hello.txt"), b"hello world").unwrap();
+    write_random_file(&base.join("random.bin"), 8192);
+    write_pattern_file(&sub.join("pattern.dat"), 4096);
+    fs::create_dir_all(base.join("empty_dir")).unwrap();
+}
+
+/// Recursively collect all relative file paths and their SHA-256 hashes.
+fn dir_fingerprint(base: &Path) -> std::collections::BTreeMap<String, [u8; 32]> {
+    let mut map = std::collections::BTreeMap::new();
+    collect_files(base, base, &mut map);
+    map
+}
+
+fn collect_files(root: &Path, current: &Path, map: &mut std::collections::BTreeMap<String, [u8; 32]>) {
+    for entry in fs::read_dir(current).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let rel = path.strip_prefix(root).unwrap().to_string_lossy().to_string();
+        if path.is_dir() {
+            collect_files(root, &path, map);
+        } else {
+            map.insert(rel, sha256(&path));
+        }
+    }
+}
+
+#[test]
+fn archive_pack_unpack_roundtrip() {
+    let dir = tmp();
+    let src = dir.path().join("mydir");
+    fs::create_dir(&src).unwrap();
+    create_test_dir(&src);
+
+    let tar_path = dir.path().join("mydir.tar");
+    archive::pack(&src, &tar_path).expect("pack failed");
+    assert!(tar_path.exists());
+
+    let extract_dir = dir.path().join("extracted");
+    archive::unpack(&tar_path, &extract_dir).expect("unpack failed");
+
+    // The archive stores "mydir/" as the root entry, so extracted content is in extracted/mydir/
+    let restored = extract_dir.join("mydir");
+    assert!(restored.is_dir(), "extracted directory should exist");
+
+    let orig = dir_fingerprint(&src);
+    let rest = dir_fingerprint(&restored);
+    assert_eq!(orig, rest, "directory contents must match after pack/unpack");
+}
+
+#[test]
+fn archive_encrypt_decrypt_roundtrip_aes() {
+    let dir = tmp();
+    let src = dir.path().join("secret_dir");
+    fs::create_dir(&src).unwrap();
+    create_test_dir(&src);
+
+    let tar_tmp = dir.path().join("tmp.tar");
+    archive::pack(&src, &tar_tmp).expect("pack failed");
+
+    let enc = dir.path().join("secret_dir.tar.enc");
+    engine::encrypt(&tar_tmp, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
+        .expect("encrypt failed");
+    fs::remove_file(&tar_tmp).unwrap();
+
+    let dec_tar = dir.path().join("decrypted.tar");
+    engine::decrypt(&enc, &dec_tar, PASSWORD).expect("decrypt failed");
+
+    let extract_dir = dir.path().join("restored");
+    archive::unpack(&dec_tar, &extract_dir).expect("unpack failed");
+
+    let orig = dir_fingerprint(&src);
+    let rest = dir_fingerprint(&extract_dir.join("secret_dir"));
+    assert_eq!(orig, rest, "directory contents must match after encrypt/decrypt roundtrip");
+}
+
+#[test]
+fn archive_encrypt_decrypt_roundtrip_chacha() {
+    let dir = tmp();
+    let src = dir.path().join("chacha_dir");
+    fs::create_dir(&src).unwrap();
+    create_test_dir(&src);
+
+    let tar_tmp = dir.path().join("tmp.tar");
+    archive::pack(&src, &tar_tmp).expect("pack failed");
+
+    let enc = dir.path().join("chacha_dir.tar.enc");
+    engine::encrypt(&tar_tmp, &enc, PASSWORD, CipherType::ChaCha20Poly1305, Some(CHUNK_1MB), &TEST_KDF)
+        .expect("encrypt failed");
+    fs::remove_file(&tar_tmp).unwrap();
+
+    let dec_tar = dir.path().join("decrypted.tar");
+    engine::decrypt(&enc, &dec_tar, PASSWORD).expect("decrypt failed");
+
+    let extract_dir = dir.path().join("restored");
+    archive::unpack(&dec_tar, &extract_dir).expect("unpack failed");
+
+    let orig = dir_fingerprint(&src);
+    let rest = dir_fingerprint(&extract_dir.join("chacha_dir"));
+    assert_eq!(orig, rest, "directory contents must match after encrypt/decrypt roundtrip");
+}
+
+#[test]
+fn archive_empty_directory() {
+    let dir = tmp();
+    let src = dir.path().join("emptydir");
+    fs::create_dir(&src).unwrap();
+
+    let tar_path = dir.path().join("empty.tar");
+    archive::pack(&src, &tar_path).expect("pack failed");
+
+    let enc = dir.path().join("empty.tar.enc");
+    engine::encrypt(&tar_path, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
+        .expect("encrypt failed");
+
+    let dec_tar = dir.path().join("dec.tar");
+    engine::decrypt(&enc, &dec_tar, PASSWORD).expect("decrypt failed");
+
+    let extract_dir = dir.path().join("restored");
+    archive::unpack(&dec_tar, &extract_dir).expect("unpack failed");
+    assert!(extract_dir.join("emptydir").is_dir(), "empty directory should be preserved");
+}
+
+#[test]
+fn archive_nested_directories() {
+    let dir = tmp();
+    let src = dir.path().join("nested");
+    fs::create_dir_all(src.join("a/b/c/d")).unwrap();
+    fs::write(src.join("a/b/c/d/deep.txt"), b"deep content").unwrap();
+    fs::write(src.join("a/top.txt"), b"top level").unwrap();
+
+    let tar_path = dir.path().join("nested.tar");
+    archive::pack(&src, &tar_path).expect("pack failed");
+
+    let enc = dir.path().join("nested.tar.enc");
+    engine::encrypt(&tar_path, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
+        .expect("encrypt failed");
+
+    let dec_tar = dir.path().join("dec.tar");
+    engine::decrypt(&enc, &dec_tar, PASSWORD).expect("decrypt failed");
+
+    let extract_dir = dir.path().join("restored");
+    archive::unpack(&dec_tar, &extract_dir).expect("unpack failed");
+
+    let orig = dir_fingerprint(&src);
+    let rest = dir_fingerprint(&extract_dir.join("nested"));
+    assert_eq!(orig, rest, "deeply nested directory contents must match");
+}
+
+#[test]
+fn archive_wrong_password_fails() {
+    let dir = tmp();
+    let src = dir.path().join("secret");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("file.txt"), b"secret data").unwrap();
+
+    let tar_path = dir.path().join("secret.tar");
+    archive::pack(&src, &tar_path).expect("pack failed");
+
+    let enc = dir.path().join("secret.tar.enc");
+    engine::encrypt(&tar_path, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
+        .expect("encrypt failed");
+
+    let dec_tar = dir.path().join("bad.tar");
+    let result = engine::decrypt(&enc, &dec_tar, b"wrong-password");
+    assert!(result.is_err(), "decryption with wrong password should fail for archives");
+}
+
+#[test]
+fn archive_pack_rejects_non_directory() {
+    let dir = tmp();
+    let file = dir.path().join("not_a_dir.txt");
+    fs::write(&file, b"just a file").unwrap();
+    let tar_path = dir.path().join("out.tar");
+    let result = archive::pack(&file, &tar_path);
+    assert!(result.is_err(), "pack should reject non-directory input");
+}
+
+#[test]
+fn archive_temp_file_cleanup() {
+    let dir = tmp();
+    let temp = archive::TempFile::new(&dir.path().join("ref"), ".test")
+        .expect("TempFile creation failed");
+    let path = temp.path().to_path_buf();
+    assert!(path.exists(), "temp file should exist after creation");
+    drop(temp);
+    assert!(!path.exists(), "temp file should be deleted after drop");
+}
+
+// ===========================================================================
+// Directory archive: symlink handling
+// ===========================================================================
+
+#[cfg(unix)]
+#[test]
+fn archive_preserves_valid_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tmp();
+    let src = dir.path().join("links");
+    fs::create_dir_all(src.join("subdir")).unwrap();
+    fs::write(src.join("real.txt"), b"target file").unwrap();
+    fs::write(src.join("subdir/nested.txt"), b"nested file").unwrap();
+    // Symlink within the same directory
+    symlink("real.txt", src.join("link_same_dir")).unwrap();
+    // Symlink from subdir to parent (valid: stays within archive)
+    symlink("../real.txt", src.join("subdir/link_to_parent")).unwrap();
+
+    let tar_path = dir.path().join("links.tar");
+    archive::pack(&src, &tar_path).expect("pack failed");
+
+    let extract_dir = dir.path().join("extracted");
+    archive::unpack(&tar_path, &extract_dir).expect("unpack failed");
+
+    let restored = extract_dir.join("links");
+    // Verify the symlinks exist and point to the right targets
+    assert!(restored.join("link_same_dir").is_symlink());
+    assert_eq!(
+        fs::read_to_string(restored.join("link_same_dir")).unwrap(),
+        "target file"
+    );
+    assert!(restored.join("subdir/link_to_parent").is_symlink());
+    assert_eq!(
+        fs::read_to_string(restored.join("subdir/link_to_parent")).unwrap(),
+        "target file"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn archive_rejects_escaping_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tmp();
+    let src = dir.path().join("evil");
+    fs::create_dir(&src).unwrap();
+    // Create a symlink that escapes the archive root
+    symlink("../../etc/passwd", src.join("escape")).unwrap();
+
+    let tar_path = dir.path().join("evil.tar");
+    archive::pack(&src, &tar_path).expect("pack failed");
+
+    let extract_dir = dir.path().join("extracted");
+    let result = archive::unpack(&tar_path, &extract_dir);
+    assert!(result.is_err(), "symlink escaping archive root must be rejected");
+    let err_msg = format!("{:#}", result.unwrap_err());
+    assert!(
+        err_msg.contains("escaping extraction root"),
+        "error should mention escaping root, got: {err_msg}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn archive_rejects_absolute_symlink_target() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tmp();
+    let src = dir.path().join("abslink");
+    fs::create_dir(&src).unwrap();
+    symlink("/etc/passwd", src.join("abs")).unwrap();
+
+    let tar_path = dir.path().join("abslink.tar");
+    archive::pack(&src, &tar_path).expect("pack failed");
+
+    let extract_dir = dir.path().join("extracted");
+    let result = archive::unpack(&tar_path, &extract_dir);
+    assert!(result.is_err(), "absolute symlink target must be rejected");
+    let err_msg = format!("{:#}", result.unwrap_err());
+    assert!(
+        err_msg.contains("escaping extraction root"),
+        "error should mention escaping root, got: {err_msg}"
+    );
+}
+
+// ===========================================================================
+// Directory archive: large directory with many files
+// ===========================================================================
+
+#[test]
+fn archive_many_files() {
+    let dir = tmp();
+    let src = dir.path().join("many_files");
+    fs::create_dir(&src).unwrap();
+    for i in 0..50 {
+        fs::write(src.join(format!("file_{i:03}.txt")), format!("content {i}")).unwrap();
+    }
+
+    let tar_path = dir.path().join("many.tar");
+    archive::pack(&src, &tar_path).expect("pack failed");
+
+    let enc = dir.path().join("many.tar.enc");
+    engine::encrypt(&tar_path, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
+        .expect("encrypt failed");
+
+    let dec_tar = dir.path().join("dec.tar");
+    engine::decrypt(&enc, &dec_tar, PASSWORD).expect("decrypt failed");
+
+    let extract_dir = dir.path().join("restored");
+    archive::unpack(&dec_tar, &extract_dir).expect("unpack failed");
+
+    let orig = dir_fingerprint(&src);
+    let rest = dir_fingerprint(&extract_dir.join("many_files"));
+    assert_eq!(orig, rest, "directory with many files must match after roundtrip");
+}
+
+// ===========================================================================
+// Directory archive: binary and mixed content
+// ===========================================================================
+
+#[test]
+fn archive_binary_content_roundtrip() {
+    let dir = tmp();
+    let src = dir.path().join("bindir");
+    fs::create_dir_all(src.join("data")).unwrap();
+    // Large binary file
+    write_random_file(&src.join("data/random.bin"), 2 * CHUNK_1MB as usize + 7777);
+    // Empty file
+    fs::write(src.join("data/empty"), b"").unwrap();
+    // 1-byte file
+    fs::write(src.join("one_byte"), &[0xAB]).unwrap();
+
+    let tar_path = dir.path().join("bin.tar");
+    archive::pack(&src, &tar_path).expect("pack failed");
+
+    let enc = dir.path().join("bin.tar.enc");
+    engine::encrypt(&tar_path, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
+        .expect("encrypt failed");
+
+    let dec_tar = dir.path().join("dec.tar");
+    engine::decrypt(&enc, &dec_tar, PASSWORD).expect("decrypt failed");
+
+    let extract_dir = dir.path().join("restored");
+    archive::unpack(&dec_tar, &extract_dir).expect("unpack failed");
+
+    let orig = dir_fingerprint(&src);
+    let rest = dir_fingerprint(&extract_dir.join("bindir"));
+    assert_eq!(orig, rest, "binary content must be preserved through roundtrip");
 }

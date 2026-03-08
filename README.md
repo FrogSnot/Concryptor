@@ -22,6 +22,7 @@ A multi-threaded AEAD encryption engine built in Rust. Encrypts and decrypts fil
 - **In-place encryption**: `seal_in_place_separate_tag` / `open_in_place` via `ring` minimizes allocation in the hot loop
 - **Password zeroization**: Keys and passwords are securely wiped from memory after use
 - **O_DIRECT + sector-aligned format**: 4 KiB-aligned header and chunk slots enable `O_DIRECT` I/O, bypassing the kernel page cache for DMA-speed reads/writes on NVMe. Buffer pools use `std::alloc` with 4096-byte alignment
+- **Directory encryption**: Encrypt entire directories as a single encrypted archive. Tar-based packing preserves file names, permissions, timestamps, and directory structure inside the ciphertext. Extraction validates against path traversal and symlink escape attacks
 - **Self-describing file format**: Header stores cipher, chunk size, original file size, salt, base nonce, and Argon2id KDF parameters
 
 ## Performance
@@ -107,6 +108,18 @@ concryptor encrypt myfile.dat -p "password"
 
 > **Security note:** `--password` / `-p` passes the password as a CLI argument, which is visible in `ps` output and shell history. For interactive use, omit it to get the secure hidden prompt. For scripting, prefer clearing history afterward or using a wrapper that reads from a file descriptor.
 
+### Encrypt a directory
+
+```bash
+# Encrypt a directory (auto-detects, produces mydir.tar.enc)
+concryptor encrypt mydir/
+
+# With custom cipher and output
+concryptor encrypt mydir/ --cipher chacha -o secrets.enc
+```
+
+Directory encryption creates a temporary tar archive (`.concryptor-*.tar`, 0600 permissions, CSPRNG-named), encrypts it, then auto-deletes the temp file. File names, directory structure, permissions, and timestamps are all inside the encrypted payload.
+
 ### Decrypt
 
 ```bash
@@ -119,6 +132,18 @@ concryptor decrypt encrypted.enc -o restored.dat
 # Non-interactive
 concryptor decrypt myfile.dat.enc -p "password"
 ```
+
+### Decrypt and extract a directory
+
+```bash
+# Decrypt and extract in one step (auto-strips .tar.enc -> directory name)
+concryptor decrypt mydir.tar.enc --extract
+
+# Short flag, custom output directory
+concryptor decrypt mydir.tar.enc -x -o restored_dir/
+```
+
+Without `--extract`, decrypting a directory archive produces the intermediate `.tar` file, which you can inspect or extract manually.
 
 ### Help
 
@@ -157,7 +182,7 @@ The salt and base nonce are generated fresh from `rand::thread_rng()` (backed by
 
 ## Security Design
 
-- **Nonce derivation**: `chunk_nonce = base_nonce XOR chunk_index` (TLS 1.3 style). Swapping chunks causes decryption failure because the nonce at position N won't match the nonce used to encrypt the chunk originally at position M.
+- **Nonce derivation**: `chunk_nonce = base_nonce XOR chunk_index` (TLS 1.3 style). Swapping chunks causes decryption failure because the nonce at position N won't match the nonce used to encrypt the chunk originally at position M. Note: XOR-based nonce derivation has a theoretical weakness when the *same key* is used across multiple streams (distinct base nonces can produce overlapping nonce spaces). This does not apply to Concryptor because each encryption generates a fresh 128-bit random salt, producing a unique Argon2id key per file. Nonce uniqueness only matters under the same key, and key reuse probability is ~2^-128 per file pair.
 - **Header-authenticated AAD**: Every chunk's AEAD call uses `AAD = full_aligned_header (4096) || chunk_index (8 LE) || is_final (1)` (4105 bytes total). The entire 4 KiB header sector (core fields, KDF parameters, and reserved padding) is bound into every chunk's authentication tag. Modifying *any* header byte (cipher type, chunk size, original size, salt, nonce, KDF parameters, or reserved padding) invalidates all chunks. This prevents truncation attacks where an adversary edits `original_size` and removes trailing chunks, and also prevents smuggling data into the reserved padding region. Legacy v3 files are decrypted with 52-byte AAD for backward compatibility; no downgrade from v4 to v3 is possible because the version byte itself is within the authenticated AAD.
 - **STREAM-style final chunk indicator**: The last byte of the AAD is `0x01` for the final chunk and `0x00` for all others. This prevents two attacks:
   - **Truncation**: Removing the final chunk and promoting a non-final chunk to the end fails because the non-final chunk was encrypted with `is_final = 0x00` but decryption expects `0x01`.
@@ -169,7 +194,7 @@ The salt and base nonce are generated fresh from `rand::thread_rng()` (backed by
 ## Testing
 
 ```bash
-# Run the full test suite (40 tests)
+# Run the full test suite (67 tests)
 cargo test
 
 # Run benchmarks (HTML reports in target/criterion/)
@@ -194,6 +219,12 @@ The test suite covers:
 - **Reserved header bytes tampering detection** (modified padding region)
 - Non-deterministic encryption verification
 - Stress test with 256 small chunks
+- Directory archive pack/unpack roundtrips (both ciphers)
+- Empty directory, deeply nested directory, many-files, and binary content roundtrips
+- Symlink preservation for valid internal links
+- Rejection of symlinks escaping the extraction root (absolute and relative traversal)
+- Temp file auto-cleanup on Drop
+- Wrong password rejection for encrypted archives
 
 ## Dependencies
 
@@ -210,6 +241,7 @@ The test suite covers:
 | `zeroize` | Secure memory wiping |
 | `anyhow` | Error handling |
 | `rpassword` | Hidden password input |
+| `tar` | Directory archiving and extraction |
 
 ## License
 

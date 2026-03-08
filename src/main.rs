@@ -1,9 +1,10 @@
+mod archive;
 mod cli;
 mod crypto;
 mod engine;
 mod header;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::Result;
@@ -18,10 +19,24 @@ fn run() -> Result<()> {
 
     match cli.command {
         Command::Encrypt { input, output, cipher, chunk_size, memory, password } => {
+            let is_dir = input.is_dir();
+
             let output = output.unwrap_or_else(|| {
-                let mut p = input.as_os_str().to_owned();
-                p.push(".enc");
-                PathBuf::from(p)
+                if is_dir {
+                    // Resolve the true directory name (handles ".", "..", trailing /)
+                    let dir_name = input
+                        .canonicalize()
+                        .ok()
+                        .and_then(|c| c.file_name().map(|n| n.to_owned()))
+                        .unwrap_or_else(|| std::ffi::OsString::from("archive"));
+                    let mut name = dir_name;
+                    name.push(".tar.enc");
+                    input.parent().unwrap_or(Path::new(".")).join(name)
+                } else {
+                    let mut p = input.as_os_str().to_owned();
+                    p.push(".enc");
+                    PathBuf::from(p)
+                }
             });
 
             let cipher_type = match cipher {
@@ -48,23 +63,32 @@ fn run() -> Result<()> {
                 t_cost: 3,
                 p_cost: 4,
             };
-            let result = engine::encrypt(&input, &output, password.as_bytes(), cipher_type, Some(chunk_bytes), &kdf_params);
+
+            // If input is a directory, create a temporary tar archive first.
+            // The temp file is auto-deleted when _temp_guard drops.
+            let (effective_input, _temp_guard) = if is_dir {
+                let temp = archive::TempFile::new(&output, ".tar")?;
+                eprintln!("Archiving directory...");
+                archive::pack(&input, temp.path())?;
+                (temp.path().to_path_buf(), Some(temp))
+            } else {
+                (input.clone(), None)
+            };
+
+            let result = engine::encrypt(
+                &effective_input, &output,
+                password.as_bytes(), cipher_type,
+                Some(chunk_bytes), &kdf_params,
+            );
             password.zeroize();
+            // Clean up partial .enc output on failure (temp tar is auto-cleaned by Drop).
+            if result.is_err() {
+                let _ = std::fs::remove_file(&output);
+            }
             result?;
         }
 
-        Command::Decrypt { input, output, password } => {
-            let output = output.unwrap_or_else(|| {
-                let name = input.to_string_lossy();
-                if let Some(stripped) = name.strip_suffix(".enc") {
-                    PathBuf::from(stripped)
-                } else {
-                    let mut p = input.as_os_str().to_owned();
-                    p.push(".dec");
-                    PathBuf::from(p)
-                }
-            });
-
+        Command::Decrypt { input, output, extract, password } => {
             let mut password = match password {
                 Some(p) => {
                     if p.is_empty() {
@@ -75,9 +99,45 @@ fn run() -> Result<()> {
                 None => rpassword::prompt_password("Password: ")
                     .map_err(|e| anyhow::anyhow!("failed to read password: {e}"))?,
             };
-            let result = engine::decrypt(&input, &output, password.as_bytes());
-            password.zeroize();
-            result?;
+
+            if extract {
+                let extract_dir = output.unwrap_or_else(|| {
+                    let name = input.to_string_lossy();
+                    if let Some(stripped) = name.strip_suffix(".tar.enc") {
+                        PathBuf::from(stripped)
+                    } else if let Some(stripped) = name.strip_suffix(".enc") {
+                        PathBuf::from(stripped)
+                    } else {
+                        let mut p = input.as_os_str().to_owned();
+                        p.push(".d");
+                        PathBuf::from(p)
+                    }
+                });
+
+                let temp = archive::TempFile::new(&input, ".tar")?;
+                let result = engine::decrypt(&input, temp.path(), password.as_bytes());
+                password.zeroize();
+                result?;
+
+                eprintln!("Extracting archive...");
+                archive::unpack(temp.path(), &extract_dir)?;
+                eprintln!("Extracted to {}", extract_dir.display());
+            } else {
+                let output = output.unwrap_or_else(|| {
+                    let name = input.to_string_lossy();
+                    if let Some(stripped) = name.strip_suffix(".enc") {
+                        PathBuf::from(stripped)
+                    } else {
+                        let mut p = input.as_os_str().to_owned();
+                        p.push(".dec");
+                        PathBuf::from(p)
+                    }
+                });
+
+                let result = engine::decrypt(&input, &output, password.as_bytes());
+                password.zeroize();
+                result?;
+            }
         }
     }
 
