@@ -29,7 +29,7 @@ tar = "0.4"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
-sha2 = "0.10"
+sha2 = "0.11"
 
 [[bench]]
 name = "throughput"
