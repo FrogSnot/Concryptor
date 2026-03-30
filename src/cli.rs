@@ -14,7 +14,8 @@ pub enum CipherArg {
     version,
     about = "A multi-threaded AEAD encryption engine",
     long_about = "Concryptor encrypts and decrypts files using AES-256-GCM or ChaCha20-Poly1305 \
-                  with parallel chunk processing, memory-mapped I/O, and Argon2id key derivation."
+                  with parallel chunk processing, a triple-buffered io_uring pipeline with \
+                  O_DIRECT kernel bypass, and Argon2id key derivation."
 )]
 pub struct Cli {
     #[command(subcommand)]

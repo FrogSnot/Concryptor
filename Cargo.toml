@@ -2,9 +2,15 @@
 name = "concryptor"
 version = "1.0.2"
 edition = "2021"
+rust-version = "1.75"
 description = "A multi-threaded AEAD encryption engine"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/FrogSnot/Concryptor"
+homepage = "https://github.com/FrogSnot/Concryptor"
+readme = "README.md"
+authors = ["FrogSnot"]
+keywords = ["encryption", "aead", "cli", "chacha20", "aes-gcm"]
+categories = ["cryptography", "command-line-utilities"]
 
 [dependencies]
 ring = "0.17"

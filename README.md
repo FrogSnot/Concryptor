@@ -1,6 +1,7 @@
 # Concryptor
 
 [![Crates.io](https://img.shields.io/crates/v/concryptor.svg)](https://crates.io/crates/concryptor)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
 
 A multi-threaded AEAD encryption engine built in Rust. Encrypts and decrypts files at gigabyte-per-second throughput using a triple-buffered `io_uring` pipeline, parallel chunk processing via Rayon, and assembly-optimized ciphers via `ring`.
 
@@ -242,6 +243,19 @@ The test suite covers:
 | `anyhow` | Error handling |
 | `rpassword` | Hidden password input |
 | `tar` | Directory archiving and extraction |
+
+## Install
+
+```bash
+# From crates.io (recommended)
+cargo install concryptor
+
+# From source
+git clone https://github.com/FrogSnot/Concryptor
+cd Concryptor
+cargo build --release
+# Binary is at target/release/concryptor
+```
 
 ## License
 
