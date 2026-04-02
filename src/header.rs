@@ -39,8 +39,10 @@ impl KdfParams {
     pub fn write_to_aligned(&self, buf: &mut [u8]) {
         debug_assert!(buf.len() >= KDF_PARAMS_OFFSET + 12);
         buf[KDF_PARAMS_OFFSET..KDF_PARAMS_OFFSET + 4].copy_from_slice(&self.m_cost.to_le_bytes());
-        buf[KDF_PARAMS_OFFSET + 4..KDF_PARAMS_OFFSET + 8].copy_from_slice(&self.t_cost.to_le_bytes());
-        buf[KDF_PARAMS_OFFSET + 8..KDF_PARAMS_OFFSET + 12].copy_from_slice(&self.p_cost.to_le_bytes());
+        buf[KDF_PARAMS_OFFSET + 4..KDF_PARAMS_OFFSET + 8]
+            .copy_from_slice(&self.t_cost.to_le_bytes());
+        buf[KDF_PARAMS_OFFSET + 8..KDF_PARAMS_OFFSET + 12]
+            .copy_from_slice(&self.p_cost.to_le_bytes());
     }
 
     /// Read KDF parameters from an aligned header buffer.
@@ -49,13 +51,29 @@ impl KdfParams {
         if buf.len() < KDF_PARAMS_OFFSET + 12 {
             return Self::LEGACY;
         }
-        let m = u32::from_le_bytes(buf[KDF_PARAMS_OFFSET..KDF_PARAMS_OFFSET + 4].try_into().unwrap());
-        let t = u32::from_le_bytes(buf[KDF_PARAMS_OFFSET + 4..KDF_PARAMS_OFFSET + 8].try_into().unwrap());
-        let p = u32::from_le_bytes(buf[KDF_PARAMS_OFFSET + 8..KDF_PARAMS_OFFSET + 12].try_into().unwrap());
+        let m = u32::from_le_bytes(
+            buf[KDF_PARAMS_OFFSET..KDF_PARAMS_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let t = u32::from_le_bytes(
+            buf[KDF_PARAMS_OFFSET + 4..KDF_PARAMS_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let p = u32::from_le_bytes(
+            buf[KDF_PARAMS_OFFSET + 8..KDF_PARAMS_OFFSET + 12]
+                .try_into()
+                .unwrap(),
+        );
         if m == 0 && t == 0 && p == 0 {
             Self::LEGACY
         } else {
-            Self { m_cost: m, t_cost: t, p_cost: p }
+            Self {
+                m_cost: m,
+                t_cost: t,
+                p_cost: p,
+            }
         }
     }
 }
@@ -105,7 +123,14 @@ impl Header {
         salt: [u8; SALT_LEN],
         base_nonce: [u8; NONCE_LEN],
     ) -> Self {
-        Self { version: VERSION, cipher, chunk_size, original_size, salt, base_nonce }
+        Self {
+            version: VERSION,
+            cipher,
+            chunk_size,
+            original_size,
+            salt,
+            base_nonce,
+        }
     }
 
     pub fn serialize(&self, buf: &mut [u8]) {
@@ -146,13 +171,12 @@ impl Header {
         pos += MAGIC.len();
 
         let version = buf[pos];
-        if version < 3 || version > VERSION {
+        if !(3..=VERSION).contains(&version) {
             bail!("unsupported file version: {version} (expected 3..{VERSION})");
         }
         pos += 1;
 
-        let cipher = CipherType::from_byte(buf[pos])
-            .context("failed to parse cipher type")?;
+        let cipher = CipherType::from_byte(buf[pos]).context("failed to parse cipher type")?;
         pos += 1;
 
         let chunk_size = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
@@ -168,7 +192,14 @@ impl Header {
         let mut base_nonce = [0u8; NONCE_LEN];
         base_nonce.copy_from_slice(&buf[pos..pos + NONCE_LEN]);
 
-        Ok(Self { version, cipher, chunk_size, original_size, salt, base_nonce })
+        Ok(Self {
+            version,
+            cipher,
+            chunk_size,
+            original_size,
+            salt,
+            base_nonce,
+        })
     }
 
     /// Total output file size for encryption.

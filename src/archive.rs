@@ -16,7 +16,11 @@ impl TempFile {
     /// Create a new empty temp file in the same directory as `reference_path`.
     pub fn new(reference_path: &Path, suffix: &str) -> Result<Self> {
         let dir = reference_path.parent().unwrap_or(Path::new("."));
-        let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
         let mut buf = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut buf);
         let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
@@ -118,7 +122,10 @@ pub fn unpack(archive_path: &Path, output_dir: &Path) -> Result<()> {
     archive.set_preserve_permissions(true);
     archive.set_unpack_xattrs(false);
 
-    for entry in archive.entries().context("failed to read archive entries")? {
+    for entry in archive
+        .entries()
+        .context("failed to read archive entries")?
+    {
         let mut entry = entry.context("corrupt archive entry")?;
         let path = entry.path().context("invalid entry path")?.into_owned();
 

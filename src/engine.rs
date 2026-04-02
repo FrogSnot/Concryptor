@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use io_uring::{IoUring, opcode, types};
+use io_uring::{opcode, types, IoUring};
 use rand::RngCore;
 use rayon::prelude::*;
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
@@ -37,9 +37,16 @@ fn build_aad(header_bytes: &[u8], chunk_index: u64, is_final: bool) -> Vec<u8> {
 pub struct Cipher(LessSafeKey);
 
 impl Cipher {
-    fn encrypt_chunk(&self, nonce: &[u8; NONCE_LEN], aad: &[u8], buf: &mut [u8]) -> Result<[u8; TAG_SIZE]> {
+    fn encrypt_chunk(
+        &self,
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        buf: &mut [u8],
+    ) -> Result<[u8; TAG_SIZE]> {
         let n = Nonce::assume_unique_for_key(*nonce);
-        let tag = self.0.seal_in_place_separate_tag(n, Aad::from(aad), buf)
+        let tag = self
+            .0
+            .seal_in_place_separate_tag(n, Aad::from(aad), buf)
             .map_err(|_| anyhow::anyhow!("encryption failed"))?;
         let mut t = [0u8; TAG_SIZE];
         t.copy_from_slice(tag.as_ref());
@@ -50,7 +57,8 @@ impl Cipher {
     /// After success, plaintext is in `buf[..buf.len() - TAG_SIZE]`.
     fn decrypt_chunk(&self, nonce: &[u8; NONCE_LEN], aad: &[u8], buf: &mut [u8]) -> Result<()> {
         let n = Nonce::assume_unique_for_key(*nonce);
-        self.0.open_in_place(n, Aad::from(aad), buf)
+        self.0
+            .open_in_place(n, Aad::from(aad), buf)
             .map_err(|_| anyhow::anyhow!("decryption failed: wrong password or tampered data"))?;
         Ok(())
     }
@@ -93,8 +101,8 @@ const PIPELINE_DEPTH: usize = 3;
 fn compute_batch_cap(num_chunks: usize, chunk_size: u64) -> usize {
     let by_mem = (MAX_BATCH_BYTES / chunk_size.max(1)).max(1) as usize;
     // Ensure at least PIPELINE_DEPTH batches so the triple-buffer can overlap.
-    let by_pipeline = (num_chunks + PIPELINE_DEPTH - 1) / PIPELINE_DEPTH;
-    num_chunks.min(by_mem).min(by_pipeline).min(4096).max(1)
+    let by_pipeline = num_chunks.div_ceil(PIPELINE_DEPTH);
+    num_chunks.min(by_mem).min(by_pipeline).clamp(1, 4096)
 }
 
 /// Drain CQEs, routing completions to per-slot counters via user_data tags.
@@ -169,13 +177,19 @@ impl AlignedBuf {
         Self { ptr, len, layout }
     }
 
-    fn as_mut_ptr(&self) -> *mut u8 { self.ptr }
-    fn as_ptr(&self) -> *const u8 { self.ptr }
+    fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+    fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
 }
 
 impl Drop for AlignedBuf {
     fn drop(&mut self) {
-        unsafe { alloc::dealloc(self.ptr, self.layout); }
+        unsafe {
+            alloc::dealloc(self.ptr, self.layout);
+        }
     }
 }
 
@@ -258,7 +272,11 @@ pub fn encrypt(
     rand::thread_rng().fill_bytes(&mut salt);
     rand::thread_rng().fill_bytes(&mut base_nonce);
 
-    eprintln!("Deriving key with Argon2id ({} MiB, {} iterations)...", kdf_params.m_cost / 1024, kdf_params.t_cost);
+    eprintln!(
+        "Deriving key with Argon2id ({} MiB, {} iterations)...",
+        kdf_params.m_cost / 1024,
+        kdf_params.t_cost
+    );
     let mut key = derive_key(password, &salt, kdf_params)?;
     let cipher = build_cipher(cipher_type, &key)?;
     zeroize_key(&mut key);
@@ -268,7 +286,16 @@ pub fn encrypt(
         .len();
     let num_chunks = Header::num_chunks(input_len, chunk_size);
 
-    encrypt_with_cipher(input_path, output_path, &cipher, cipher_type, chunk_size, salt, base_nonce, kdf_params)?;
+    encrypt_with_cipher(
+        input_path,
+        output_path,
+        &cipher,
+        cipher_type,
+        chunk_size,
+        salt,
+        base_nonce,
+        kdf_params,
+    )?;
 
     eprintln!(
         "Encrypted {} → {} ({} chunks, {})",
@@ -284,6 +311,7 @@ pub fn encrypt(
 /// Uses a triple-buffered pipeline: while batch N's writes are in-flight
 /// and batch N+2's reads are in-flight, batch N+1 is being encrypted by Rayon.
 /// Buffers are pre-allocated once and reused across all batches.
+#[allow(clippy::too_many_arguments)]
 pub fn encrypt_with_cipher(
     input_path: &Path,
     output_path: &Path,
@@ -313,7 +341,10 @@ pub fn encrypt_with_cipher(
     header.serialize(&mut header_bytes);
 
     let output_file = OpenOptions::new()
-        .read(true).write(true).create(true).truncate(true)
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
         .custom_flags(libc::O_DIRECT)
         .mode(0o600)
         .open(output_path)
@@ -334,11 +365,11 @@ pub fn encrypt_with_cipher(
     let mut slots: Vec<SlotPool> = (0..PIPELINE_DEPTH)
         .map(|_| SlotPool::new(batch_cap, buf_size))
         .collect();
-    let mut ring = IoUring::new((batch_cap * 2) as u32)
-        .context("failed to create io_uring instance")?;
+    let mut ring =
+        IoUring::new((batch_cap * 2) as u32).context("failed to create io_uring instance")?;
 
     let pb = make_progress_bar(num_chunks as u64, "Encrypting");
-    let num_batches = (num_chunks + batch_cap - 1) / batch_cap;
+    let num_batches = num_chunks.div_ceil(batch_cap);
 
     // Per-slot pending CQE counters, routed via user_data tags.
     let mut pending: [usize; PIPELINE_DEPTH] = [0; PIPELINE_DEPTH];
@@ -377,8 +408,14 @@ pub fn encrypt_with_cipher(
                         )
                         .offset(i as u64 * cs)
                         .build()
-                        .user_data(pack_user_data(read_slot, false, pt_len as u32));
-                        unsafe { sq.push(&sqe).expect("SQ full"); }
+                        .user_data(pack_user_data(
+                            read_slot,
+                            false,
+                            pt_len as u32,
+                        ));
+                        unsafe {
+                            sq.push(&sqe).expect("SQ full");
+                        }
                         pending[read_slot] += 1;
                     }
                 }
@@ -424,8 +461,14 @@ pub fn encrypt_with_cipher(
                     )
                     .offset(out_off)
                     .build()
-                    .user_data(pack_user_data(crypto_slot, true, disk_chunk as u32));
-                    unsafe { sq.push(&sqe).expect("SQ full"); }
+                    .user_data(pack_user_data(
+                        crypto_slot,
+                        true,
+                        disk_chunk as u32,
+                    ));
+                    unsafe {
+                        sq.push(&sqe).expect("SQ full");
+                    }
                     pending[crypto_slot] += 1;
                 }
             }
@@ -439,11 +482,7 @@ pub fn encrypt_with_cipher(
     Ok(())
 }
 
-pub fn decrypt(
-    input_path: &Path,
-    output_path: &Path,
-    password: &[u8],
-) -> Result<()> {
+pub fn decrypt(input_path: &Path, output_path: &Path, password: &[u8]) -> Result<()> {
     let input_file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECT)
@@ -470,7 +509,11 @@ pub fn decrypt(
         );
     }
 
-    eprintln!("Deriving key with Argon2id ({} MiB, {} iterations)...", kdf_params.m_cost / 1024, kdf_params.t_cost);
+    eprintln!(
+        "Deriving key with Argon2id ({} MiB, {} iterations)...",
+        kdf_params.m_cost / 1024,
+        kdf_params.t_cost
+    );
     let mut key = derive_key(password, &header.salt, &kdf_params)?;
     let cipher = build_cipher(header.cipher, &key)?;
     zeroize_key(&mut key);
@@ -496,11 +539,7 @@ pub fn decrypt(
 /// Decrypt using a pre-built cipher. Skips Argon2 key derivation.
 /// Uses a triple-buffered pipeline: overlapped io_uring reads/writes
 /// with parallel Rayon decryption. Buffers pre-allocated once.
-pub fn decrypt_with_cipher(
-    input_path: &Path,
-    output_path: &Path,
-    cipher: &Cipher,
-) -> Result<()> {
+pub fn decrypt_with_cipher(input_path: &Path, output_path: &Path, cipher: &Cipher) -> Result<()> {
     let input_file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECT)
@@ -532,7 +571,10 @@ pub fn decrypt_with_cipher(
     let disk_chunk = aligned_chunk_disk_size(header.chunk_size);
 
     let output_file = OpenOptions::new()
-        .read(true).write(true).create(true).truncate(true)
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
         .mode(0o600)
         .open(output_path)
         .with_context(|| format!("cannot create output: {}", output_path.display()))?;
@@ -547,8 +589,15 @@ pub fn decrypt_with_cipher(
     };
 
     let result = decrypt_pipeline(
-        &input_file, &output_file, cipher, aad_header, &header, num_chunks,
-        last_chunk_idx, cs, disk_chunk,
+        &input_file,
+        &output_file,
+        cipher,
+        aad_header,
+        &header,
+        num_chunks,
+        last_chunk_idx,
+        cs,
+        disk_chunk,
     );
 
     if result.is_err() {
@@ -559,6 +608,7 @@ pub fn decrypt_with_cipher(
 }
 
 /// Inner pipeline for decryption, factored out so the caller can clean up on error.
+#[allow(clippy::too_many_arguments)]
 fn decrypt_pipeline(
     input_file: &File,
     output_file: &File,
@@ -578,11 +628,11 @@ fn decrypt_pipeline(
     let mut slots: Vec<SlotPool> = (0..PIPELINE_DEPTH)
         .map(|_| SlotPool::new(batch_cap, buf_size))
         .collect();
-    let mut ring = IoUring::new((batch_cap * 2) as u32)
-        .context("failed to create io_uring instance")?;
+    let mut ring =
+        IoUring::new((batch_cap * 2) as u32).context("failed to create io_uring instance")?;
 
     let pb = make_progress_bar(num_chunks as u64, "Decrypting");
-    let num_batches = (num_chunks + batch_cap - 1) / batch_cap;
+    let num_batches = num_chunks.div_ceil(batch_cap);
 
     let mut pending: [usize; PIPELINE_DEPTH] = [0; PIPELINE_DEPTH];
 
@@ -619,8 +669,14 @@ fn decrypt_pipeline(
                     )
                     .offset(in_off)
                     .build()
-                    .user_data(pack_user_data(read_slot, false, disk_chunk as u32));
-                    unsafe { sq.push(&sqe).expect("SQ full"); }
+                    .user_data(pack_user_data(
+                        read_slot,
+                        false,
+                        disk_chunk as u32,
+                    ));
+                    unsafe {
+                        sq.push(&sqe).expect("SQ full");
+                    }
                     pending[read_slot] += 1;
                 }
             }
@@ -666,8 +722,14 @@ fn decrypt_pipeline(
                         )
                         .offset(out_off)
                         .build()
-                        .user_data(pack_user_data(crypto_slot, true, pt_len as u32));
-                        unsafe { sq.push(&sqe).expect("SQ full"); }
+                        .user_data(pack_user_data(
+                            crypto_slot,
+                            true,
+                            pt_len as u32,
+                        ));
+                        unsafe {
+                            sq.push(&sqe).expect("SQ full");
+                        }
                         pending[crypto_slot] += 1;
                     }
                 }

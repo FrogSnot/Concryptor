@@ -56,10 +56,16 @@ fn roundtrip(
     cipher: CipherType,
     chunk_size: u32,
 ) {
-    engine::encrypt(input_path, enc_path, PASSWORD, cipher, Some(chunk_size), &TEST_KDF)
-        .expect("encrypt failed");
-    engine::decrypt(enc_path, dec_path, PASSWORD)
-        .expect("decrypt failed");
+    engine::encrypt(
+        input_path,
+        enc_path,
+        PASSWORD,
+        cipher,
+        Some(chunk_size),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
+    engine::decrypt(enc_path, dec_path, PASSWORD).expect("decrypt failed");
     assert_eq!(sha256(input_path), sha256(dec_path), "roundtrip mismatch");
 }
 
@@ -71,7 +77,13 @@ fn roundtrip(
 fn header_serialize_deserialize_roundtrip() {
     let salt = [0xAA; SALT_LEN];
     let nonce = [0xBB; NONCE_LEN];
-    let header = Header::new(CipherType::Aes256Gcm, 4 * 1024 * 1024, 123456789, salt, nonce);
+    let header = Header::new(
+        CipherType::Aes256Gcm,
+        4 * 1024 * 1024,
+        123456789,
+        salt,
+        nonce,
+    );
 
     let mut buf = [0u8; HEADER_SIZE];
     header.serialize(&mut buf);
@@ -301,11 +313,21 @@ fn wrong_password_fails_aes() {
     let enc = dir.path().join("secret.enc");
     let dec = dir.path().join("secret.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &input,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     let result = engine::decrypt(&enc, &dec, b"wrong-password");
-    assert!(result.is_err(), "decryption with wrong password should fail");
+    assert!(
+        result.is_err(),
+        "decryption with wrong password should fail"
+    );
 }
 
 #[test]
@@ -316,11 +338,21 @@ fn wrong_password_fails_chacha() {
     let enc = dir.path().join("secret.enc");
     let dec = dir.path().join("secret.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::ChaCha20Poly1305, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &input,
+        &enc,
+        PASSWORD,
+        CipherType::ChaCha20Poly1305,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     let result = engine::decrypt(&enc, &dec, b"wrong-password");
-    assert!(result.is_err(), "decryption with wrong password should fail");
+    assert!(
+        result.is_err(),
+        "decryption with wrong password should fail"
+    );
 }
 
 // ===========================================================================
@@ -335,8 +367,15 @@ fn tampered_ciphertext_detected() {
     let enc = dir.path().join("secret.enc");
     let dec = dir.path().join("secret.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &input,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     // Flip a byte in the middle of the ciphertext body (inside chunk 0)
     let mut data = fs::read(&enc).unwrap();
@@ -356,8 +395,15 @@ fn tampered_tag_detected() {
     let enc = dir.path().join("secret.enc");
     let dec = dir.path().join("secret.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &input,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     // Corrupt a byte inside the tag of the only chunk
     let mut data = fs::read(&enc).unwrap();
@@ -377,8 +423,15 @@ fn tampered_header_salt_detected() {
     let enc = dir.path().join("secret.enc");
     let dec = dir.path().join("secret.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &input,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     // Flip a byte in the salt region of the header
     let mut data = fs::read(&enc).unwrap();
@@ -398,8 +451,15 @@ fn truncated_file_detected() {
     let enc = dir.path().join("secret.enc");
     let dec = dir.path().join("secret.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &input,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     // Truncate the encrypted file
     let data = fs::read(&enc).unwrap();
@@ -422,8 +482,15 @@ fn chunk_swap_attack_detected() {
     let enc = dir.path().join("secret.enc");
     let dec = dir.path().join("secret.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &input,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     let mut data = fs::read(&enc).unwrap();
     let dcs = aligned_chunk_disk_size(CHUNK_1MB) as usize;
@@ -437,7 +504,10 @@ fn chunk_swap_attack_detected() {
     fs::write(&enc, &data).unwrap();
 
     let result = engine::decrypt(&enc, &dec, PASSWORD);
-    assert!(result.is_err(), "chunk swap should be detected by nonce+AAD binding");
+    assert!(
+        result.is_err(),
+        "chunk swap should be detected by nonce+AAD binding"
+    );
 }
 
 // ===========================================================================
@@ -452,8 +522,15 @@ fn encrypted_file_has_correct_size() {
     write_random_file(&input, size);
     let enc = dir.path().join("sized.enc");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &input,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     let expected = Header::output_size(size as u64, CHUNK_1MB);
     let actual = fs::metadata(&enc).unwrap().len();
@@ -467,8 +544,15 @@ fn encrypted_file_header_readable() {
     write_random_file(&input, 1000);
     let enc = dir.path().join("readable.enc");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::ChaCha20Poly1305, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &input,
+        &enc,
+        PASSWORD,
+        CipherType::ChaCha20Poly1305,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     let data = fs::read(&enc).unwrap();
     let header = Header::deserialize(&data[..HEADER_SIZE]).unwrap();
@@ -489,13 +573,32 @@ fn encryption_is_non_deterministic() {
     let enc1 = dir.path().join("ndet1.enc");
     let enc2 = dir.path().join("ndet2.enc");
 
-    engine::encrypt(&input, &enc1, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF).unwrap();
-    engine::encrypt(&input, &enc2, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF).unwrap();
+    engine::encrypt(
+        &input,
+        &enc1,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .unwrap();
+    engine::encrypt(
+        &input,
+        &enc2,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .unwrap();
 
     let d1 = fs::read(&enc1).unwrap();
     let d2 = fs::read(&enc2).unwrap();
     // Salt and nonce are random, so content must differ
-    assert_ne!(d1, d2, "encrypting the same file twice should produce different output");
+    assert_ne!(
+        d1, d2,
+        "encrypting the same file twice should produce different output"
+    );
 }
 
 // ===========================================================================
@@ -510,7 +613,15 @@ fn cipher_type_mismatch_fails() {
     let enc = dir.path().join("cross.enc");
     let dec = dir.path().join("cross.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF).unwrap();
+    engine::encrypt(
+        &input,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .unwrap();
 
     // Overwrite the cipher byte in the header to claim it's ChaCha20
     let mut data = fs::read(&enc).unwrap();
@@ -518,7 +629,10 @@ fn cipher_type_mismatch_fails() {
     fs::write(&enc, &data).unwrap();
 
     let result = engine::decrypt(&enc, &dec, PASSWORD);
-    assert!(result.is_err(), "cipher type mismatch should fail decryption");
+    assert!(
+        result.is_err(),
+        "cipher type mismatch should fail decryption"
+    );
 }
 
 // ===========================================================================
@@ -549,8 +663,15 @@ fn truncation_attack_modify_original_size_detected() {
     let enc = dir.path().join("trunc.enc");
     let dec = dir.path().join("trunc.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &input,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     // Attacker modifies original_size in the header to claim only 2 chunks,
     // then truncates the file to match the new claimed size.
@@ -578,8 +699,15 @@ fn truncation_attack_remove_last_chunk_detected() {
     let enc = dir.path().join("trunc2.enc");
     let dec = dir.path().join("trunc2.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &input,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     // Attacker removes the last chunk and adjusts header to 1 chunk.
     let data = fs::read(&enc).unwrap();
@@ -609,8 +737,15 @@ fn modified_chunk_size_in_header_detected() {
     let enc = dir.path().join("hdr.enc");
     let dec = dir.path().join("hdr.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &input,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     // Change the chunk_size field in the header (offset 12..16)
     let mut data = fs::read(&enc).unwrap();
@@ -635,8 +770,15 @@ fn tampered_padding_detected() {
     let enc = dir.path().join("pad.enc");
     let dec = dir.path().join("pad.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &input,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     // Write non-zero bytes into the padding region after the tag.
     let mut data = fs::read(&enc).unwrap();
@@ -663,12 +805,22 @@ fn failed_decrypt_removes_output() {
     let enc = dir.path().join("cleanup.enc");
     let dec = dir.path().join("cleanup.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &input,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     let result = engine::decrypt(&enc, &dec, b"wrong-password");
     assert!(result.is_err());
-    assert!(!dec.exists(), "output file must be removed after failed decryption");
+    assert!(
+        !dec.exists(),
+        "output file must be removed after failed decryption"
+    );
 }
 
 // ===========================================================================
@@ -683,8 +835,15 @@ fn tampered_reserved_header_bytes_detected() {
     let enc = dir.path().join("res.enc");
     let dec = dir.path().join("res.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &input,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     // Modify reserved padding bytes (offset 64-4095) that were previously unauthenticated.
     let mut data = fs::read(&enc).unwrap();
@@ -708,8 +867,15 @@ fn tampered_kdf_params_in_header_detected() {
     let enc = dir.path().join("kdf.enc");
     let dec = dir.path().join("kdf.dec");
 
-    engine::encrypt(&input, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &input,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     // Modify the KDF m_cost field (bytes 52-55) in the header.
     let mut data = fs::read(&enc).unwrap();
@@ -745,11 +911,19 @@ fn dir_fingerprint(base: &Path) -> std::collections::BTreeMap<String, [u8; 32]> 
     map
 }
 
-fn collect_files(root: &Path, current: &Path, map: &mut std::collections::BTreeMap<String, [u8; 32]>) {
+fn collect_files(
+    root: &Path,
+    current: &Path,
+    map: &mut std::collections::BTreeMap<String, [u8; 32]>,
+) {
     for entry in fs::read_dir(current).unwrap() {
         let entry = entry.unwrap();
         let path = entry.path();
-        let rel = path.strip_prefix(root).unwrap().to_string_lossy().to_string();
+        let rel = path
+            .strip_prefix(root)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         if path.is_dir() {
             collect_files(root, &path, map);
         } else {
@@ -778,7 +952,10 @@ fn archive_pack_unpack_roundtrip() {
 
     let orig = dir_fingerprint(&src);
     let rest = dir_fingerprint(&restored);
-    assert_eq!(orig, rest, "directory contents must match after pack/unpack");
+    assert_eq!(
+        orig, rest,
+        "directory contents must match after pack/unpack"
+    );
 }
 
 #[test]
@@ -792,8 +969,15 @@ fn archive_encrypt_decrypt_roundtrip_aes() {
     archive::pack(&src, &tar_tmp).expect("pack failed");
 
     let enc = dir.path().join("secret_dir.tar.enc");
-    engine::encrypt(&tar_tmp, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &tar_tmp,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
     fs::remove_file(&tar_tmp).unwrap();
 
     let dec_tar = dir.path().join("decrypted.tar");
@@ -804,7 +988,10 @@ fn archive_encrypt_decrypt_roundtrip_aes() {
 
     let orig = dir_fingerprint(&src);
     let rest = dir_fingerprint(&extract_dir.join("secret_dir"));
-    assert_eq!(orig, rest, "directory contents must match after encrypt/decrypt roundtrip");
+    assert_eq!(
+        orig, rest,
+        "directory contents must match after encrypt/decrypt roundtrip"
+    );
 }
 
 #[test]
@@ -818,8 +1005,15 @@ fn archive_encrypt_decrypt_roundtrip_chacha() {
     archive::pack(&src, &tar_tmp).expect("pack failed");
 
     let enc = dir.path().join("chacha_dir.tar.enc");
-    engine::encrypt(&tar_tmp, &enc, PASSWORD, CipherType::ChaCha20Poly1305, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &tar_tmp,
+        &enc,
+        PASSWORD,
+        CipherType::ChaCha20Poly1305,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
     fs::remove_file(&tar_tmp).unwrap();
 
     let dec_tar = dir.path().join("decrypted.tar");
@@ -830,7 +1024,10 @@ fn archive_encrypt_decrypt_roundtrip_chacha() {
 
     let orig = dir_fingerprint(&src);
     let rest = dir_fingerprint(&extract_dir.join("chacha_dir"));
-    assert_eq!(orig, rest, "directory contents must match after encrypt/decrypt roundtrip");
+    assert_eq!(
+        orig, rest,
+        "directory contents must match after encrypt/decrypt roundtrip"
+    );
 }
 
 #[test]
@@ -843,15 +1040,25 @@ fn archive_empty_directory() {
     archive::pack(&src, &tar_path).expect("pack failed");
 
     let enc = dir.path().join("empty.tar.enc");
-    engine::encrypt(&tar_path, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &tar_path,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     let dec_tar = dir.path().join("dec.tar");
     engine::decrypt(&enc, &dec_tar, PASSWORD).expect("decrypt failed");
 
     let extract_dir = dir.path().join("restored");
     archive::unpack(&dec_tar, &extract_dir).expect("unpack failed");
-    assert!(extract_dir.join("emptydir").is_dir(), "empty directory should be preserved");
+    assert!(
+        extract_dir.join("emptydir").is_dir(),
+        "empty directory should be preserved"
+    );
 }
 
 #[test]
@@ -866,8 +1073,15 @@ fn archive_nested_directories() {
     archive::pack(&src, &tar_path).expect("pack failed");
 
     let enc = dir.path().join("nested.tar.enc");
-    engine::encrypt(&tar_path, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &tar_path,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     let dec_tar = dir.path().join("dec.tar");
     engine::decrypt(&enc, &dec_tar, PASSWORD).expect("decrypt failed");
@@ -891,12 +1105,22 @@ fn archive_wrong_password_fails() {
     archive::pack(&src, &tar_path).expect("pack failed");
 
     let enc = dir.path().join("secret.tar.enc");
-    engine::encrypt(&tar_path, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &tar_path,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     let dec_tar = dir.path().join("bad.tar");
     let result = engine::decrypt(&enc, &dec_tar, b"wrong-password");
-    assert!(result.is_err(), "decryption with wrong password should fail for archives");
+    assert!(
+        result.is_err(),
+        "decryption with wrong password should fail for archives"
+    );
 }
 
 #[test]
@@ -912,8 +1136,8 @@ fn archive_pack_rejects_non_directory() {
 #[test]
 fn archive_temp_file_cleanup() {
     let dir = tmp();
-    let temp = archive::TempFile::new(&dir.path().join("ref"), ".test")
-        .expect("TempFile creation failed");
+    let temp =
+        archive::TempFile::new(&dir.path().join("ref"), ".test").expect("TempFile creation failed");
     let path = temp.path().to_path_buf();
     assert!(path.exists(), "temp file should exist after creation");
     drop(temp);
@@ -975,7 +1199,10 @@ fn archive_rejects_escaping_symlink() {
 
     let extract_dir = dir.path().join("extracted");
     let result = archive::unpack(&tar_path, &extract_dir);
-    assert!(result.is_err(), "symlink escaping archive root must be rejected");
+    assert!(
+        result.is_err(),
+        "symlink escaping archive root must be rejected"
+    );
     let err_msg = format!("{:#}", result.unwrap_err());
     assert!(
         err_msg.contains("escaping extraction root"),
@@ -1023,8 +1250,15 @@ fn archive_many_files() {
     archive::pack(&src, &tar_path).expect("pack failed");
 
     let enc = dir.path().join("many.tar.enc");
-    engine::encrypt(&tar_path, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &tar_path,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     let dec_tar = dir.path().join("dec.tar");
     engine::decrypt(&enc, &dec_tar, PASSWORD).expect("decrypt failed");
@@ -1034,7 +1268,10 @@ fn archive_many_files() {
 
     let orig = dir_fingerprint(&src);
     let rest = dir_fingerprint(&extract_dir.join("many_files"));
-    assert_eq!(orig, rest, "directory with many files must match after roundtrip");
+    assert_eq!(
+        orig, rest,
+        "directory with many files must match after roundtrip"
+    );
 }
 
 // ===========================================================================
@@ -1057,8 +1294,15 @@ fn archive_binary_content_roundtrip() {
     archive::pack(&src, &tar_path).expect("pack failed");
 
     let enc = dir.path().join("bin.tar.enc");
-    engine::encrypt(&tar_path, &enc, PASSWORD, CipherType::Aes256Gcm, Some(CHUNK_1MB), &TEST_KDF)
-        .expect("encrypt failed");
+    engine::encrypt(
+        &tar_path,
+        &enc,
+        PASSWORD,
+        CipherType::Aes256Gcm,
+        Some(CHUNK_1MB),
+        &TEST_KDF,
+    )
+    .expect("encrypt failed");
 
     let dec_tar = dir.path().join("dec.tar");
     engine::decrypt(&enc, &dec_tar, PASSWORD).expect("decrypt failed");
@@ -1068,5 +1312,8 @@ fn archive_binary_content_roundtrip() {
 
     let orig = dir_fingerprint(&src);
     let rest = dir_fingerprint(&extract_dir.join("bindir"));
-    assert_eq!(orig, rest, "binary content must be preserved through roundtrip");
+    assert_eq!(
+        orig, rest,
+        "binary content must be preserved through roundtrip"
+    );
 }

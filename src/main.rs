@@ -18,7 +18,14 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Encrypt { input, output, cipher, chunk_size, memory, password } => {
+        Command::Encrypt {
+            input,
+            output,
+            cipher,
+            chunk_size,
+            memory,
+            password,
+        } => {
             let is_dir = input.is_dir();
 
             let output = output.unwrap_or_else(|| {
@@ -60,8 +67,7 @@ fn run() -> Result<()> {
             };
             let kdf_params = header::KdfParams {
                 m_cost: memory.saturating_mul(1024),
-                t_cost: 3,
-                p_cost: 4,
+                ..header::KdfParams::DEFAULT
             };
 
             // If input is a directory, create a temporary tar archive first.
@@ -76,9 +82,12 @@ fn run() -> Result<()> {
             };
 
             let result = engine::encrypt(
-                &effective_input, &output,
-                password.as_bytes(), cipher_type,
-                Some(chunk_bytes), &kdf_params,
+                &effective_input,
+                &output,
+                password.as_bytes(),
+                cipher_type,
+                Some(chunk_bytes),
+                &kdf_params,
             );
             password.zeroize();
             // Clean up partial .enc output on failure (temp tar is auto-cleaned by Drop).
@@ -88,7 +97,12 @@ fn run() -> Result<()> {
             result?;
         }
 
-        Command::Decrypt { input, output, extract, password } => {
+        Command::Decrypt {
+            input,
+            output,
+            extract,
+            password,
+        } => {
             let mut password = match password {
                 Some(p) => {
                     if p.is_empty() {
