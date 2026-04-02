@@ -4,9 +4,7 @@ use std::path::Path;
 use concryptor::crypto::derive_key;
 use concryptor::engine::{self, build_cipher, Cipher};
 use concryptor::header::{CipherType, KdfParams, NONCE_LEN, SALT_LEN};
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::RngCore;
 
 const PASSWORD: &[u8] = b"benchmark-password-concryptor";
@@ -68,7 +66,14 @@ fn bench_encrypt_throughput(c: &mut Criterion) {
             // Warmup: one encrypt so OS caches the file
             let warmup = dir.path().join("warmup.enc");
             engine::encrypt_with_cipher(
-                &input, &warmup, &cipher, cipher_type, chunk_size, SALT, BASE_NONCE, &BENCH_KDF,
+                &input,
+                &warmup,
+                &cipher,
+                cipher_type,
+                chunk_size,
+                SALT,
+                BASE_NONCE,
+                &BENCH_KDF,
             )
             .unwrap();
 
@@ -126,7 +131,14 @@ fn bench_decrypt_throughput(c: &mut Criterion) {
             write_random_file(&input, size as usize);
             let enc = dir.path().join("encrypted.enc");
             engine::encrypt_with_cipher(
-                &input, &enc, &cipher, cipher_type, chunk_size, SALT, BASE_NONCE, &BENCH_KDF,
+                &input,
+                &enc,
+                &cipher,
+                cipher_type,
+                chunk_size,
+                SALT,
+                BASE_NONCE,
+                &BENCH_KDF,
             )
             .unwrap();
 
