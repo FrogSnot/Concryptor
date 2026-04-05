@@ -3,7 +3,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use rand::RngCore;
+use rand::Rng;
 use tar::EntryType;
 
 /// A temporary file that is automatically deleted when dropped.
@@ -22,7 +22,7 @@ impl TempFile {
             dir
         };
         let mut buf = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut buf);
+        rand::rng().fill_bytes(&mut buf);
         let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
         let path = dir.join(format!(".concryptor-{hex}{suffix}"));
         OpenOptions::new()

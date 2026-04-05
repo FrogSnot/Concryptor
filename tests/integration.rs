@@ -8,7 +8,7 @@ use concryptor::header::{
     aligned_chunk_disk_size, CipherType, Header, KdfParams, ALIGNED_HEADER_SIZE, HEADER_SIZE,
     NONCE_LEN, SALT_LEN,
 };
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -31,7 +31,7 @@ fn tmp() -> TempDir {
 }
 
 fn write_random_file(path: &Path, size: usize) {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut buf = vec![0u8; size];
     rng.fill_bytes(&mut buf);
     fs::write(path, &buf).expect("write failed");
