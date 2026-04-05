@@ -200,7 +200,7 @@ fn aes_roundtrip_empty_file() {
 fn aes_roundtrip_1_byte() {
     let dir = tmp();
     let input = dir.path().join("one.bin");
-    fs::write(&input, &[0xFF]).unwrap();
+    fs::write(&input, [0xFF]).unwrap();
     let enc = dir.path().join("one.enc");
     let dec = dir.path().join("one.dec");
     roundtrip(&input, &enc, &dec, CipherType::Aes256Gcm, CHUNK_1MB);
@@ -1288,7 +1288,7 @@ fn archive_binary_content_roundtrip() {
     // Empty file
     fs::write(src.join("data/empty"), b"").unwrap();
     // 1-byte file
-    fs::write(src.join("one_byte"), &[0xAB]).unwrap();
+    fs::write(src.join("one_byte"), [0xAB]).unwrap();
 
     let tar_path = dir.path().join("bin.tar");
     archive::pack(&src, &tar_path).expect("pack failed");
