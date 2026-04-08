@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use io_uring::{opcode, types, IoUring};
-use rand::RngCore;
+use rand::Rng;
 use rayon::prelude::*;
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 
@@ -269,8 +269,8 @@ pub fn encrypt(
 
     let mut salt = [0u8; SALT_LEN];
     let mut base_nonce = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut salt);
-    rand::thread_rng().fill_bytes(&mut base_nonce);
+    rand::rng().fill_bytes(&mut salt);
+    rand::rng().fill_bytes(&mut base_nonce);
 
     eprintln!(
         "Deriving key with Argon2id ({} MiB, {} iterations)...",

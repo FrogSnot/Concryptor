@@ -1,6 +1,6 @@
 [package]
 name = "concryptor"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 rust-version = "1.75"
 description = "A multi-threaded AEAD encryption engine"
@@ -19,17 +19,17 @@ libc = "0.2"
 argon2 = "0.5"
 rayon = "1.10"
 clap = { version = "4", features = ["derive"] }
-indicatif = "0.17"
-rand = "0.8"
+indicatif = "0.18"
+rand = "0.10"
 anyhow = "1"
 rpassword = "7"
 zeroize = { version = "1", features = ["derive"] }
 tar = "0.4"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
-sha2 = "0.10"
+sha2 = "0.11"
 
 [[bench]]
 name = "throughput"
