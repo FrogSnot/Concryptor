@@ -179,7 +179,7 @@ Offset  Size   Field
 
 For 4 MiB chunks: each disk slot is `ceil((4194304 + 16) / 4096) * 4096 = 4198400` bytes (4080 bytes of padding per chunk). The 4032 reserved bytes in the header are available for future features (asymmetric key slots, metadata, etc.).
 
-The salt and base nonce are generated fresh from `rand::thread_rng()` (backed by the OS CSPRNG) on every encryption. Reusing a password across files is safe because different salts produce different Argon2id keys, and different base nonces produce different per-chunk nonces.
+The salt and base nonce are generated fresh from `rand::rng()` (backed by the OS CSPRNG) on every encryption. Reusing a password across files is safe because different salts produce different Argon2id keys, and different base nonces produce different per-chunk nonces.
 
 ## Security Design
 
@@ -188,7 +188,7 @@ The salt and base nonce are generated fresh from `rand::thread_rng()` (backed by
 - **STREAM-style final chunk indicator**: The last byte of the AAD is `0x01` for the final chunk and `0x00` for all others. This prevents two attacks:
   - **Truncation**: Removing the final chunk and promoting a non-final chunk to the end fails because the non-final chunk was encrypted with `is_final = 0x00` but decryption expects `0x01`.
   - **Extension**: Appending forged chunks fails because the attacker cannot produce a valid tag for `is_final = 0x01` without the key.
-- **Fresh randomness per file**: A 16-byte salt and 12-byte base nonce are drawn from the OS CSPRNG (`rand::thread_rng()`) for every encryption. Two encryptions of the same file with the same password produce completely different ciphertext. Nonce reuse (which is catastrophic for AES-GCM) is avoided by construction.
+- **Fresh randomness per file**: A 16-byte salt and 12-byte base nonce are drawn from the OS CSPRNG (`rand::rng()`) for every encryption. Two encryptions of the same file with the same password produce completely different ciphertext. Nonce reuse (which is catastrophic for AES-GCM) is avoided by construction.
 - **Key derivation**: Argon2id with configurable memory cost (default 256 MiB, tunable via `--memory`), 3 time iterations, parallelism of 4. The 256 MiB default is 4× the OWASP minimum and expensive for GPU/FPGA/ASIC attackers. KDF parameters are stored in the file header (bytes 52-63), making files self-describing — decryption always uses the correct parameters regardless of current defaults. If bytes 52-63 are all zero (legacy pre-KDF-params files), the old 64 MiB / 3 / 4 defaults are applied.
 - **Zeroization**: Encryption keys are zeroized immediately after cipher construction. Passwords are zeroized after use.
 

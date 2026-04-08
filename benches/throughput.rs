@@ -4,8 +4,9 @@ use std::path::Path;
 use concryptor::crypto::derive_key;
 use concryptor::engine::{self, build_cipher, Cipher};
 use concryptor::header::{CipherType, KdfParams, NONCE_LEN, SALT_LEN};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use rand::RngCore;
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use rand::Rng;
+use std::hint::black_box;
 
 const PASSWORD: &[u8] = b"benchmark-password-concryptor";
 const SALT: [u8; SALT_LEN] = [0xAA; SALT_LEN];
@@ -19,7 +20,7 @@ const BENCH_KDF: KdfParams = KdfParams {
 };
 
 fn write_random_file(path: &Path, size: usize) {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut buf = vec![0u8; size];
     rng.fill_bytes(&mut buf);
     fs::write(path, &buf).expect("write failed");
