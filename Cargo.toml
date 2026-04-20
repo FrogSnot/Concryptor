@@ -17,7 +17,7 @@ ring = "0.17"
 io-uring = "0.7"
 libc = "0.2"
 argon2 = "0.5"
-rayon = "1.10"
+rayon = "1.12"
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.18"
 rand = "0.10"
