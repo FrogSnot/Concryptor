@@ -2,6 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/concryptor.svg)](https://crates.io/crates/concryptor)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
+[![oosmetrics](https://api.oosmetrics.com/api/v1/badge/achievement/97e564fa-9f3f-4391-b864-0020e43f6df1.svg)](https://oosmetrics.com/repo/FrogSnot/Concryptor)
 
 A multi-threaded AEAD encryption engine built in Rust. Encrypts and decrypts files at gigabyte-per-second throughput using a triple-buffered `io_uring` pipeline, parallel chunk processing via Rayon, and assembly-optimized ciphers via `ring`.
 
